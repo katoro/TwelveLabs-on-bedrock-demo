@@ -82,12 +82,15 @@ Your AWS user/role needs permissions for:
 - CloudFormation
 - IAM role creation
 
+## Enablem Twelve Labs model on Bedrock
+- Before Deployment, you should enable (opt-in) for Twelve Labs model on Amazon Bedrock console 
+
 ## Quick Start
 
 1. **Clone and setup**:
    ```bash
    git clone <repository>
-   cd shorts-v2
+   cd TwelvelLabs-on-bedrock-demo
    ```
 
 2. **Configure your environment** (optional):
@@ -107,22 +110,13 @@ Your AWS user/role needs permissions for:
 4. **Start frontend**:
    ```bash
    cd frontend
+   npm install
    npm start
    ```
 
-5. **Run tests** (optional):
-   ```bash
-   # Load test environment variables
-   source .env.test
-   
-   # Run API tests
-   python test_final_api.py
-   python test_async_api.py
-   ```
-
-6. **Access the application**:
+5. **Access the application**:
    - Open http://localhost:3000
-   - Upload a video (test.mp4 included)
+   - Upload a video
    - Analyze with Pegasus
    - Generate embeddings with Marengo
    - Search for similar content
