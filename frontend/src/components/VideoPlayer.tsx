@@ -1,4 +1,5 @@
 import React, { useRef, useEffect, useState } from 'react';
+import { authFetch } from '../authFetch';
 
 interface VideoPlayerProps {
   videoS3Uri: string;
@@ -39,7 +40,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
         const apiUrl = `${process.env.REACT_APP_API_URL}/video-url?videoS3Uri=${encodeURIComponent(videoS3Uri)}`;
         console.log(`📡 Making request to: ${apiUrl}`);
         
-        const response = await fetch(apiUrl);
+        const response = await authFetch(apiUrl);
         console.log(`📡 Response status: ${response.status} ${response.statusText}`);
         console.log(`📡 Response headers:`, Object.fromEntries(response.headers.entries()));
         

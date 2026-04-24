@@ -1,223 +1,211 @@
-import React, { useState, useRef } from 'react';
+import React, { useEffect, useState } from 'react';
+import { authFetch } from '../authFetch';
+import Alert from '@cloudscape-design/components/alert';
+import Badge from '@cloudscape-design/components/badge';
+import Box from '@cloudscape-design/components/box';
+import Button from '@cloudscape-design/components/button';
+import ColumnLayout from '@cloudscape-design/components/column-layout';
+import Container from '@cloudscape-design/components/container';
+import FileUpload from '@cloudscape-design/components/file-upload';
+import Header from '@cloudscape-design/components/header';
+import ProgressBar from '@cloudscape-design/components/progress-bar';
+import SpaceBetween from '@cloudscape-design/components/space-between';
+import Table from '@cloudscape-design/components/table';
 
-interface VideoUploadProps {
-  onVideoUploaded: (video: { key: string; bucket: string; s3Uri: string }) => void;
+interface Video {
+  key: string;
+  filename: string;
+  s3Uri: string;
+  bucket: string;
+  contentType: string;
+  uploadedAt: string;
+  isShared?: boolean;
 }
 
-const VideoUpload: React.FC<VideoUploadProps> = ({ onVideoUploaded }) => {
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+const MAX_BYTES = 2 * 1024 * 1024 * 1024;
+
+const VideoUpload: React.FC = () => {
+  const [files, setFiles] = useState<File[]>([]);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [videos, setVideos] = useState<Video[]>([]);
+  const [loadingVideos, setLoadingVideos] = useState(false);
 
-  const API_BASE_URL = process.env.REACT_APP_API_URL || 'https://your-api-gateway-url';
+  const API_BASE_URL = (process.env.REACT_APP_API_URL || '').replace(/\/+$/, '');
+  const selectedFile = files[0] ?? null;
 
-  const handleFileSelect = (file: File) => {
-    setSelectedFile(file);
-    setError(null);
-    setSuccess(null);
-    setUploadProgress(0);
-  };
+  useEffect(() => { loadVideos(); }, []);
 
-  const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    const files = e.dataTransfer.files;
-    if (files.length > 0) {
-      handleFileSelect(files[0]);
+  const loadVideos = async () => {
+    setLoadingVideos(true);
+    try {
+      const res = await authFetch(`${API_BASE_URL}/videos`);
+      const data = await res.json();
+      setVideos(data.videos || []);
+    } catch (e) {
+      console.error('Failed to load videos:', e);
+    } finally {
+      setLoadingVideos(false);
     }
   };
 
-  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-  };
-
-  const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (files && files.length > 0) {
-      handleFileSelect(files[0]);
-    }
+  const verifyS3Upload = async (_s3Uri: string): Promise<void> => {
+    await new Promise((resolve) => setTimeout(resolve, 2000));
   };
 
   const uploadVideo = async () => {
     if (!selectedFile) return;
-
+    if (selectedFile.size > MAX_BYTES) {
+      setError('File exceeds 2GB limit.');
+      return;
+    }
     setUploading(true);
     setError(null);
+    setSuccess(null);
     setUploadProgress(0);
 
     try {
-      // Get presigned URL
-      const response = await fetch(`${API_BASE_URL}/upload`, {
+      const response = await authFetch(`${API_BASE_URL}/upload`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           filename: selectedFile.name,
           contentType: selectedFile.type,
         }),
       });
-
-      if (!response.ok) {
-        throw new Error('Failed to get upload URL');
-      }
-
+      if (!response.ok) throw new Error('Failed to get upload URL');
       const { uploadUrl, fields, key, bucket } = await response.json();
 
-      // Create FormData for proper multipart upload
       const formData = new FormData();
-      
-      // Add all the fields from presigned POST in the correct order
-      Object.entries(fields).forEach(([key, value]) => {
-        formData.append(key, value as string);
-      });
-      
-      // Add the file last (required by S3)
+      Object.entries(fields).forEach(([k, v]) => formData.append(k, v as string));
       formData.append('file', selectedFile);
 
       setUploadProgress(10);
 
-      // Use XMLHttpRequest for better upload tracking and verification
       await new Promise<void>((resolve, reject) => {
         const xhr = new XMLHttpRequest();
-        
-        // Track upload progress
         xhr.upload.onprogress = (event) => {
           if (event.lengthComputable) {
-            const percentComplete = (event.loaded / event.total) * 80; // Leave 20% for verification
-            setUploadProgress(Math.round(10 + percentComplete));
+            const pct = (event.loaded / event.total) * 80;
+            setUploadProgress(Math.round(10 + pct));
           }
         };
-        
         xhr.onload = () => {
           if (xhr.status === 200 || xhr.status === 204) {
-            console.log('S3 upload successful');
             setUploadProgress(90);
-            
-            // Verify the object exists in S3 before resolving
-            const s3Uri = `s3://${bucket}/${key}`;
-            verifyS3Upload(s3Uri)
-              .then(() => {
-                setUploadProgress(100);
-                resolve();
-              })
+            verifyS3Upload(`s3://${bucket}/${key}`)
+              .then(() => { setUploadProgress(100); resolve(); })
               .catch(reject);
           } else {
-            console.error('S3 upload failed:', xhr.status, xhr.statusText, xhr.responseText);
             reject(new Error(`Upload failed with status ${xhr.status}: ${xhr.statusText}`));
           }
         };
-        
-        xhr.onerror = () => {
-          console.error('S3 upload network error');
-          reject(new Error('Network error during upload'));
-        };
-        
-        xhr.timeout = 300000; // 5 minute timeout for large files
-        xhr.ontimeout = () => {
-          reject(new Error('Upload timeout - file may be too large'));
-        };
-        
-        // Send the request
+        xhr.onerror = () => reject(new Error('Network error during upload'));
+        xhr.timeout = 300000;
+        xhr.ontimeout = () => reject(new Error('Upload timeout — file may be too large'));
         xhr.open('POST', uploadUrl);
         xhr.send(formData);
       });
 
-      setSuccess('Video uploaded and verified successfully!');
-      const s3Uri = `s3://${bucket}/${key}`;
-      onVideoUploaded({ key, bucket, s3Uri });
-
+      setSuccess(`"${selectedFile.name}" uploaded successfully.`);
+      setFiles([]);
+      loadVideos();
     } catch (err) {
-      console.error('Upload error:', err);
       setError(err instanceof Error ? err.message : 'Upload failed');
     } finally {
       setUploading(false);
     }
   };
-  
-  const verifyS3Upload = async (s3Uri: string): Promise<void> => {
-    // Give S3 a moment to process the upload
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    
-    // For now, just wait a reasonable time instead of calling the CORS-problematic endpoint
-    // The backend will handle waiting for S3 object availability when analyze/embed is called
-    console.log('S3 upload completed - backend will verify availability when processing');
-    
-    // TODO: Fix CORS for /video-url endpoint to enable proper verification
-    // For now, we rely on the backend's wait_for_s3_object function
-  };
 
   return (
-    <div className="upload-container">
-      <h2>Upload Video for Analysis</h2>
-      
-      <div
-        className="drop-zone"
-        onDrop={handleDrop}
-        onDragOver={handleDragOver}
-        onClick={() => fileInputRef.current?.click()}
-      >
-        {selectedFile ? (
-          <div className="file-info">
-            <p><strong>Selected:</strong> {selectedFile.name}</p>
-            <p><strong>Size:</strong> {(selectedFile.size / 1024 / 1024).toFixed(2)} MB</p>
-            <p><strong>Type:</strong> {selectedFile.type}</p>
-          </div>
-        ) : (
-          <div className="drop-message">
-            <p>Drag and drop a video file here, or click to select</p>
-            <p className="file-types">Supported: MP4, MOV, AVI (max 2GB)</p>
-          </div>
-        )}
-      </div>
+    <ColumnLayout columns={2} minColumnWidth={420}>
+      <Container header={<Header variant="h2" description="MP4, MOV, AVI · 최대 2GB">Upload Video</Header>}>
+        <SpaceBetween size="m">
+          <FileUpload
+            onChange={({ detail }) => {
+              setFiles(detail.value);
+              setError(null);
+              setSuccess(null);
+              setUploadProgress(0);
+            }}
+            value={files}
+            accept="video/*"
+            i18nStrings={{
+              uploadButtonText: (multiple) => (multiple ? 'Choose files' : 'Choose file'),
+              dropzoneText: (multiple) => (multiple ? 'Drop files to upload' : 'Drop file to upload'),
+              removeFileAriaLabel: (index) => `Remove file ${index + 1}`,
+              limitShowFewer: 'Show fewer',
+              limitShowMore: 'Show more',
+              errorIconAriaLabel: 'Error',
+            }}
+            showFileLastModified
+            showFileSize
+            showFileThumbnail
+            constraintText="MP4 / MOV / AVI up to 2GB"
+          />
 
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept="video/*"
-        onChange={handleFileInputChange}
-        style={{ display: 'none' }}
-      />
-
-      {selectedFile && (
-        <div style={{ marginTop: '20px' }}>
-          <button
-            className="upload-button"
+          <Button
+            variant="primary"
             onClick={uploadVideo}
-            disabled={uploading}
+            loading={uploading}
+            disabled={!selectedFile || uploading}
           >
             {uploading ? `Uploading... ${uploadProgress}%` : 'Upload Video'}
-          </button>
-        </div>
-      )}
+          </Button>
 
-      {uploading && (
-        <div className="progress-container">
-          <div className="progress-bar">
-            <div 
-              className="progress-fill" 
-              style={{ width: `${uploadProgress}%` }}
-            ></div>
-          </div>
-          <p>{uploadProgress}% uploaded</p>
-        </div>
-      )}
+          {uploading && <ProgressBar value={uploadProgress} description="Uploading to S3" />}
+          {success && <Alert type="success" dismissible onDismiss={() => setSuccess(null)}>{success}</Alert>}
+          {error && <Alert type="error" dismissible onDismiss={() => setError(null)}>{error}</Alert>}
+        </SpaceBetween>
+      </Container>
 
-      {success && <div className="success">{success}</div>}
-      {error && <div className="error">{error}</div>}
-
-      <div style={{ marginTop: '20px', fontSize: '14px', color: '#666' }}>
-        <p><strong>Requirements:</strong></p>
-        <ul style={{ textAlign: 'left', margin: '10px 0' }}>
-          <li>Video formats: MP4, MOV, AVI</li>
-          <li>Maximum file size: 2GB</li>
-          <li>Maximum duration: 2 hours</li>
-          <li>Recommended resolution: 1080p or lower</li>
-        </ul>
-      </div>
-    </div>
+      <Table
+        header={
+          <Header
+            variant="h2"
+            counter={`(${videos.length})`}
+            description="내 영상과 공용(SHARED) 영상이 함께 보입니다. 공용 영상은 사전 인덱싱되어 바로 검색/분석에 사용할 수 있습니다."
+            actions={<Button iconName="refresh" onClick={loadVideos} loading={loadingVideos} />}
+          >
+            Videos
+          </Header>
+        }
+        items={videos}
+        loading={loadingVideos}
+        loadingText="Loading videos"
+        trackBy={(v) => `${v.isShared ? 'shared' : 'mine'}-${v.key}`}
+        columnDefinitions={[
+          {
+            id: 'filename',
+            header: 'Filename',
+            cell: (v) => (
+              <SpaceBetween direction="horizontal" size="xs">
+                {v.isShared && <Badge color="blue">SHARED</Badge>}
+                <span>{v.filename}</span>
+              </SpaceBetween>
+            ),
+          },
+          {
+            id: 'contentType',
+            header: 'Type',
+            cell: (v) => v.contentType || '-',
+          },
+          {
+            id: 'uploadedAt',
+            header: 'Uploaded At',
+            cell: (v) => v.uploadedAt || '-',
+          },
+        ]}
+        empty={
+          <Box textAlign="center" color="inherit" padding={{ vertical: 'l' }}>
+            <b>No videos available yet</b>
+            <Box variant="p" color="inherit">Upload a file or wait for SHARED videos to appear.</Box>
+          </Box>
+        }
+      />
+    </ColumnLayout>
   );
 };
 
