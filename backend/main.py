@@ -2,21 +2,82 @@ import json
 import os
 import boto3
 import base64
+import time
+from decimal import Decimal
 from typing import Dict, Any
 from botocore.exceptions import ClientError
+from botocore.config import Config
 
 # Initialize AWS clients
-s3_client = boto3.client('s3', region_name=os.environ.get('REGION', 'us-east-1'))
-bedrock_client = boto3.client('bedrock-runtime', region_name=os.environ.get('REGION', 'us-east-1'))
-s3vectors_client = boto3.client('s3vectors', region_name=os.environ.get('REGION', 'us-east-1'))
+REGION = os.environ.get('REGION', 'ap-northeast-2')
+s3_client = boto3.client('s3', region_name=REGION,
+                         config=Config(s3={'addressing_style': 'virtual'}))
+bedrock_client = boto3.client('bedrock-runtime', region_name=REGION)
+# DynamoDB configuration
+dynamodb = boto3.resource('dynamodb', region_name=REGION)
+metadata_table = None
+
+def get_metadata_table():
+    global metadata_table
+    if metadata_table is None:
+        table_name = os.environ.get('METADATA_TABLE')
+        if table_name:
+            metadata_table = dynamodb.Table(table_name)
+    return metadata_table
+
+def decimal_default(obj):
+    if isinstance(obj, Decimal):
+        return int(obj) if obj == int(obj) else float(obj)
+    raise TypeError
 
 # OpenSearch configuration - initialize only when needed
 opensearch_client = None
 
-# S3 Vectors configuration
-S3_VECTOR_BUCKET = None
-S3_VECTOR_INDEX = 'video-embeddings-index'
-VECTOR_DIMENSION = 1024
+VECTOR_DIMENSION = 512  # Marengo 3.0 uses 512 dimensions
+
+DAILY_LIMITS = {
+    'analyzeCount': 20,
+    'embedCount': 10,
+    'searchCount': 100,
+}
+
+def check_and_increment_usage(user_id, usage_type, cors_headers):
+    """Atomic check-and-increment daily usage. Returns error response if over limit, None if OK."""
+    try:
+        table = get_metadata_table()
+        if not table:
+            return None
+        today = time.strftime('%Y-%m-%d', time.gmtime())
+        limit = DAILY_LIMITS.get(usage_type, 100)
+        ttl_value = int(time.time()) + 7 * 86400
+        table.update_item(
+            Key={'userId': user_id, 'sortKey': f'USAGE#{today}'},
+            UpdateExpression='SET #c = if_not_exists(#c, :zero) + :one, #ttl = if_not_exists(#ttl, :ttl)',
+            ConditionExpression='attribute_not_exists(#c) OR #c < :limit',
+            ExpressionAttributeNames={'#c': usage_type, '#ttl': 'ttl'},
+            ExpressionAttributeValues={':zero': 0, ':one': 1, ':limit': limit, ':ttl': ttl_value},
+        )
+        return None
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+            return {
+                'statusCode': 429,
+                'headers': cors_headers,
+                'body': json.dumps({'error': f'Daily limit reached ({limit} {usage_type.replace("Count","")}s/day). Try again tomorrow.'})
+            }
+        print(f"Usage check error: {e}")
+        return None
+
+SHARED_USER_ID = '__shared__'
+ADMIN_USER_SUBS = {s.strip() for s in os.environ.get('ADMIN_USER_SUBS', '').split(',') if s.strip()}
+
+def get_user_id(event):
+    """Extract user ID from Cognito JWT claims via API Gateway authorizer"""
+    claims = event.get('requestContext', {}).get('authorizer', {}).get('claims', {})
+    return claims.get('sub', 'anonymous')
+
+def is_admin(event):
+    return get_user_id(event) in ADMIN_USER_SUBS
 
 def get_account_id():
     """Get AWS Account ID dynamically"""
@@ -24,7 +85,7 @@ def get_account_id():
     if not account_id:
         # Get account ID dynamically from AWS STS
         try:
-            sts_client = boto3.client('sts', region_name=os.environ.get('REGION', 'us-east-1'))
+            sts_client = boto3.client('sts', region_name=os.environ.get('REGION', 'ap-northeast-2'))
             account_id = sts_client.get_caller_identity()['Account']
             print(f"Dynamically retrieved AWS Account ID: {account_id}")
         except Exception as e:
@@ -41,7 +102,7 @@ def get_opensearch_client():
             from opensearchpy import OpenSearch, RequestsHttpConnection, AWSV4SignerAuth
             
             opensearch_endpoint = os.environ.get('OPENSEARCH_ENDPOINT', '').replace('https://', '')
-            region = os.environ.get('REGION', 'us-east-1')
+            region = os.environ.get('REGION', 'ap-northeast-2')
             print(f"OpenSearch endpoint: {opensearch_endpoint}, region: {region}")
             
             credentials = boto3.Session().get_credentials()
@@ -63,131 +124,16 @@ def get_opensearch_client():
     
     return opensearch_client
 
-def get_or_create_s3_vector_bucket():
-    """Get or create S3 Vector bucket and index"""
-    global S3_VECTOR_BUCKET
-    if S3_VECTOR_BUCKET is None:
-        try:
-            # Generate unique bucket name
-            account_id = get_account_id()
-            region = os.environ.get('REGION', 'us-east-1')
-            S3_VECTOR_BUCKET = f"video-s3vectors-{account_id}-{region}"
-            print(f"Using S3 Vector bucket: {S3_VECTOR_BUCKET}")
-            
-            # Check if vector bucket exists, create if not
-            try:
-                # Try to get vector bucket directly
-                s3vectors_client.get_vector_bucket(vectorBucketName=S3_VECTOR_BUCKET)
-                print(f"S3 Vector bucket {S3_VECTOR_BUCKET} already exists")
-            except Exception as e:
-                if 'NotFoundException' in str(e) or 'could not be found' in str(e) or 'does not exist' in str(e).lower():
-                    print(f"Vector bucket not found. Creating S3 Vector bucket: {S3_VECTOR_BUCKET}")
-                    s3vectors_client.create_vector_bucket(vectorBucketName=S3_VECTOR_BUCKET)
-                    print(f"S3 Vector bucket {S3_VECTOR_BUCKET} created successfully")
-                    
-                    # Wait a moment for bucket to be available
-                    import time
-                    time.sleep(2)
-                else:
-                    print(f"Error checking S3 Vector bucket: {e}")
-                    raise
-            
-            # Check if vector index exists, create if not
-            try:
-                # Try to get vector index directly
-                s3vectors_client.get_index(
-                    vectorBucketName=S3_VECTOR_BUCKET,
-                    indexName=S3_VECTOR_INDEX
-                )
-                print(f"S3 Vector index {S3_VECTOR_INDEX} already exists")
-            except Exception as e:
-                if 'NotFoundException' in str(e) or 'could not be found' in str(e) or 'does not exist' in str(e).lower():
-                    print(f"Vector index not found. Creating S3 Vector index: {S3_VECTOR_INDEX}")
-                    s3vectors_client.create_index(
-                        vectorBucketName=S3_VECTOR_BUCKET,
-                        indexName=S3_VECTOR_INDEX,
-                        dataType='float32',
-                        dimension=VECTOR_DIMENSION,
-                        distanceMetric='cosine'
-                    )
-                    print(f"S3 Vector index {S3_VECTOR_INDEX} created successfully")
-                    
-                    # Wait a moment for index to be available
-                    import time
-                    time.sleep(2)
-                else:
-                    print(f"Error checking S3 Vector index: {e}")
-                    raise
-            
-        except Exception as e:
-            print(f"Error initializing S3 Vector bucket/index: {e}")
-            S3_VECTOR_BUCKET = None
-            raise
-    
-    return S3_VECTOR_BUCKET
-
-def store_embeddings_to_s3_vectors(video_id, video_s3_uri, embedding_data_list):
-    """Store video embeddings to S3 Vectors"""
+def search_opensearch(query_embedding, top_k=10, user_id=None):
+    """Search OpenSearch for similar embeddings, filtered by userId"""
     try:
         import time
         start_time = time.time()
-        
-        bucket_name = get_or_create_s3_vector_bucket()
-        if not bucket_name:
-            raise Exception("S3 Vector bucket not available")
-        
-        # Handle both single embedding and list of embeddings
-        if not isinstance(embedding_data_list, list):
-            embedding_data_list = [embedding_data_list]
-        
-        vectors = []
-        for i, embedding_data in enumerate(embedding_data_list):
-            segment_id = f"{video_id}_segment_{i}_{embedding_data.get('startSec', 0)}"
-            
-            vectors.append({
-                "key": segment_id,
-                "data": {"float32": embedding_data.get('embedding', [])},
-                "metadata": {
-                    "videoId": video_id,
-                    "videoS3Uri": video_s3_uri,
-                    "segmentId": segment_id,
-                    "startSec": embedding_data.get('startSec', 0),
-                    "endSec": embedding_data.get('endSec', 0),
-                    "duration": embedding_data.get('endSec', 0) - embedding_data.get('startSec', 0),
-                    "embeddingOption": embedding_data.get('embeddingOption', 'visual-text')
-                }
-            })
-        
-        # Store vectors in S3 Vectors
-        s3vectors_client.put_vectors(
-            vectorBucketName=bucket_name,
-            indexName=S3_VECTOR_INDEX,
-            vectors=vectors
-        )
-        
-        storage_time = time.time() - start_time
-        print(f"S3 Vectors: Stored {len(vectors)} vectors in {storage_time:.3f}s")
-        
-        return {
-            'stored_count': len(vectors),
-            'video_id': video_id,
-            'storage_time_ms': round(storage_time * 1000, 2)
-        }
-        
-    except Exception as e:
-        print(f"Error storing embeddings to S3 Vectors: {e}")
-        raise
 
-def search_opensearch(query_embedding, top_k=10):
-    """Search OpenSearch for similar embeddings"""
-    try:
-        import time
-        start_time = time.time()
-        
         opensearch = get_opensearch_client()
         if not opensearch:
             raise Exception("OpenSearch client not available")
-        
+
         # First check if index exists and get its mapping
         try:
             ensure_vector_index(opensearch)
@@ -200,19 +146,34 @@ def search_opensearch(query_embedding, top_k=10):
                     'message': 'No videos indexed yet - upload and process videos with embeddings first'
                 }
             raise
-        
-        search_body = {
-            "size": top_k,
-            "query": {
-                "knn": {
-                    "embedding": {
-                        "vector": query_embedding,
-                        "k": top_k
-                    }
+
+        knn_query = {
+            "knn": {
+                "embedding": {
+                    "vector": query_embedding,
+                    "k": top_k
                 }
-            },
-            "_source": ["videoId", "videoS3Uri", "segmentId", "startSec", "endSec", "duration", "embeddingOption", "metadata"]
+            }
         }
+
+        if user_id:
+            allowed_user_ids = [user_id, SHARED_USER_ID] if user_id != SHARED_USER_ID else [SHARED_USER_ID]
+            search_body = {
+                "size": top_k,
+                "query": {
+                    "bool": {
+                        "must": [knn_query],
+                        "filter": [{"terms": {"userId": allowed_user_ids}}]
+                    }
+                },
+                "_source": ["userId", "videoId", "videoS3Uri", "segmentId", "startSec", "endSec", "duration", "embeddingOption", "metadata"]
+            }
+        else:
+            search_body = {
+                "size": top_k,
+                "query": knn_query,
+                "_source": ["userId", "videoId", "videoS3Uri", "segmentId", "startSec", "endSec", "duration", "embeddingOption", "metadata"]
+            }
         
         search_response = opensearch.search(
             index='video-embeddings',
@@ -233,7 +194,8 @@ def search_opensearch(query_embedding, top_k=10):
                 'duration': source.get('duration', 0),
                 'embeddingOption': source.get('embeddingOption', 'visual-text'),
                 'score': hit['_score'],
-                'metadata': source.get('metadata', {})
+                'metadata': source.get('metadata', {}),
+                'isShared': source.get('userId') == SHARED_USER_ID,
             })
         
         print(f"OpenSearch: Found {len(results)} results in {search_time:.3f}s")
@@ -253,56 +215,6 @@ def search_opensearch(query_embedding, top_k=10):
                 'message': 'No videos indexed yet - upload and process videos with embeddings first'
             }
         print(f"Error searching OpenSearch: {e}")
-        raise
-
-def search_s3_vectors(query_embedding, top_k=10):
-    """Search S3 Vectors for similar embeddings"""
-    try:
-        import time
-        start_time = time.time()
-        
-        bucket_name = get_or_create_s3_vector_bucket()
-        if not bucket_name:
-            raise Exception("S3 Vector bucket not available")
-        
-        # Query the S3 Vector index
-        response = s3vectors_client.query_vectors(
-            vectorBucketName=bucket_name,
-            indexName=S3_VECTOR_INDEX,
-            queryVector={"float32": query_embedding},
-            topK=top_k,
-            returnDistance=True,
-            returnMetadata=True
-        )
-        
-        search_time = time.time() - start_time
-        
-        # Transform results to match OpenSearch format
-        results = []
-        for vector in response.get('vectors', []):
-            metadata = vector.get('metadata', {})
-            results.append({
-                'videoId': metadata.get('videoId', 'unknown'),
-                'videoS3Uri': metadata.get('videoS3Uri', ''),
-                'segmentId': metadata.get('segmentId', ''),
-                'startSec': metadata.get('startSec', 0),
-                'endSec': metadata.get('endSec', 0),
-                'duration': metadata.get('duration', 0),
-                'embeddingOption': metadata.get('embeddingOption', 'visual-text'),
-                'score': vector.get('distance', 0),  # Note: distance, not similarity score
-                'metadata': metadata
-            })
-        
-        print(f"S3 Vectors: Found {len(results)} results in {search_time:.3f}s")
-        
-        return {
-            'results': results,
-            'total': len(results),
-            'search_time_ms': round(search_time * 1000, 2)
-        }
-        
-    except Exception as e:
-        print(f"Error searching S3 Vectors: {e}")
         raise
 
 def ensure_vector_index(opensearch_client):
@@ -342,6 +254,9 @@ def ensure_vector_index(opensearch_client):
             },
             "mappings": {
                 "properties": {
+                    "userId": {
+                        "type": "keyword"
+                    },
                     "videoId": {
                         "type": "keyword"
                     },
@@ -365,7 +280,7 @@ def ensure_vector_index(opensearch_client):
                     },
                     "embedding": {
                         "type": "knn_vector",
-                        "dimension": 1024,
+                        "dimension": 512,
                         "method": {
                             "name": "hnsw",
                             "space_type": "cosinesimil",
@@ -390,106 +305,7 @@ def ensure_vector_index(opensearch_client):
         print(f"Error ensuring vector index: {e}")
         raise
 
-def store_embeddings_dual(bedrock_response, embedding_data_list):
-    """Store video embeddings to both OpenSearch and S3 Vectors for comparison"""
-    print("🗂️ === DUAL EMBEDDING STORAGE DEBUG START ===")
-    print(f"📡 bedrock_response keys: {list(bedrock_response.keys()) if isinstance(bedrock_response, dict) else 'Not a dict'}")
-    print(f"📡 bedrock_response content: {bedrock_response}")
-    print(f"📊 embedding_data_list length: {len(embedding_data_list) if isinstance(embedding_data_list, list) else 'Not a list'}")
-    
-    # Initialize storage results
-    opensearch_result = None
-    s3vectors_result = None
-    
-    # Store to OpenSearch
-    try:
-        opensearch_result = store_embeddings_to_opensearch(bedrock_response, embedding_data_list)
-    except Exception as e:
-        print(f"OpenSearch storage failed: {e}")
-        opensearch_result = {'error': str(e)}
-    
-    # Extract video metadata for S3 Vectors storage
-    video_id, video_s3_uri = extract_video_metadata(bedrock_response)
-    
-    # Store to S3 Vectors
-    try:
-        s3vectors_result = store_embeddings_to_s3_vectors(video_id, video_s3_uri, embedding_data_list)
-    except Exception as e:
-        print(f"S3 Vectors storage failed: {e}")
-        s3vectors_result = {'error': str(e)}
-    
-    print("🗂️ === DUAL EMBEDDING STORAGE DEBUG END ===")
-    
-    return {
-        'opensearch': opensearch_result,
-        's3vectors': s3vectors_result,
-        'video_id': video_id
-    }
-
-def extract_video_metadata(bedrock_response):
-    """Extract video metadata from bedrock response"""
-    video_s3_uri = ''
-    video_id = 'unknown'
-    
-    # Method 1: Try to extract from original request (if present)
-    model_input = bedrock_response.get('modelInput', {})
-    media_source = model_input.get('mediaSource', {})
-    s3_location = media_source.get('s3Location', {})
-    video_s3_uri = s3_location.get('uri', '')
-    
-    print(f"🔍 DEBUG: Method 1 - modelInput approach: '{video_s3_uri}'")
-    
-    # Method 2: Extract from output path structure if Method 1 fails
-    if not video_s3_uri:
-        output_data_config = bedrock_response.get('outputDataConfig', {})
-        s3_output_config = output_data_config.get('s3OutputDataConfig', {})
-        output_s3_uri = s3_output_config.get('s3Uri', '')
-        
-        print(f"🔍 DEBUG: Method 2 - output_s3_uri: '{output_s3_uri}'")
-        
-        # The output path structure is: s3://bucket/embeddings/{video_id}/
-        # We can extract video_id from this path and reconstruct the original video S3 URI
-        if output_s3_uri and '/embeddings/' in output_s3_uri:
-            path_parts = output_s3_uri.replace('s3://', '').split('/')
-            bucket_name = path_parts[0]
-            
-            # Find the video_id from the path after /embeddings/
-            try:
-                embeddings_index = path_parts.index('embeddings')
-                if embeddings_index + 1 < len(path_parts):
-                    extracted_folder_name = path_parts[embeddings_index + 1]
-                    
-                    # The folder name is the video filename without extension
-                    # We need to reconstruct the full video filename
-                    video_filename = f"{extracted_folder_name}.mp4"  # Assume mp4 for now
-                    
-                    # Reconstruct the original video S3 URI
-                    video_s3_uri = f"s3://{bucket_name}/videos/{video_filename}"
-                    video_id = extracted_folder_name  # Keep video_id without extension
-                    
-                    print(f"🔍 DEBUG: Method 2 success - folder name: '{extracted_folder_name}', video_id: '{video_id}', reconstructed S3 URI: '{video_s3_uri}'")
-                else:
-                    print(f"🔍 DEBUG: Method 2 failed - could not find video_id in path")
-            except (ValueError, IndexError) as e:
-                print(f"🔍 DEBUG: Method 2 failed - error parsing output path: {e}")
-        
-    # If video_id is still unknown, try to extract from S3 URI as fallback
-    if video_id == 'unknown' and video_s3_uri and video_s3_uri.startswith('s3://'):
-        # Parse s3://bucket/path/to/file.mp4 -> file.mp4
-        extracted_id = video_s3_uri.split('/')[-1]
-        # Remove file extension for cleaner ID
-        if '.' in extracted_id:
-            video_id = extracted_id.rsplit('.', 1)[0]
-        else:
-            video_id = extracted_id
-        print(f"🔍 DEBUG: Fallback extraction from S3 URI - video_id: '{video_id}'")
-    
-    if video_id == 'unknown' or not video_s3_uri:
-        print(f"⚠️ WARNING: Could not extract proper video metadata - video_id: '{video_id}', S3 URI: '{video_s3_uri}'")
-    
-    return video_id, video_s3_uri
-
-def store_embeddings_to_opensearch(bedrock_response, embedding_data_list):
+def store_embeddings_to_opensearch(bedrock_response, embedding_data_list, original_s3_uri=None, user_id=None):
     """Store video embeddings with temporal segments to OpenSearch for similarity search"""
     print("🗂️ === OPENSEARCH EMBEDDING STORAGE START ===")
     
@@ -500,8 +316,57 @@ def store_embeddings_to_opensearch(bedrock_response, embedding_data_list):
     # ALWAYS ensure index exists with proper mapping BEFORE storing documents
     ensure_vector_index(opensearch)
     
-    # Extract video metadata using shared function
-    video_id, video_s3_uri = extract_video_metadata(bedrock_response)
+    # Extract video metadata
+    video_s3_uri = original_s3_uri or ''
+    video_id = 'unknown'
+
+    # If original_s3_uri not provided, try to extract from bedrock response
+    if not video_s3_uri:
+        model_input = bedrock_response.get('modelInput', {})
+        media_source = model_input.get('mediaSource', {})
+        s3_location = media_source.get('s3Location', {})
+        video_s3_uri = s3_location.get('uri', '')
+
+    # Extract from output path structure if needed
+    if not video_s3_uri:
+        output_data_config = bedrock_response.get('outputDataConfig', {})
+        s3_output_config = output_data_config.get('s3OutputDataConfig', {})
+        output_s3_uri = s3_output_config.get('s3Uri', '')
+        if output_s3_uri and '/embeddings/' in output_s3_uri:
+            path_parts = output_s3_uri.replace('s3://', '').split('/')
+            bucket_name_parsed = path_parts[0]
+            try:
+                embeddings_index = path_parts.index('embeddings')
+                # Skip user_id folder (embeddings/{user_id}/{video_id}/)
+                # Find the last non-empty segment as video_id
+                remaining = [p for p in path_parts[embeddings_index + 1:] if p]
+                if len(remaining) >= 2:
+                    # Path is embeddings/{user_id}/{video_id}/
+                    user_id_from_path = remaining[0]
+                    extracted_folder_name = remaining[1]
+                elif len(remaining) == 1:
+                    user_id_from_path = None
+                    extracted_folder_name = remaining[0]
+                else:
+                    user_id_from_path = None
+                    extracted_folder_name = None
+                if extracted_folder_name:
+                    video_filename = f"{extracted_folder_name}.mp4"
+                    if user_id_from_path:
+                        video_s3_uri = f"s3://{bucket_name_parsed}/videos/{user_id_from_path}/{video_filename}"
+                    else:
+                        video_s3_uri = f"s3://{bucket_name_parsed}/videos/{video_filename}"
+                    video_id = extracted_folder_name
+            except (ValueError, IndexError):
+                pass
+
+    # Fallback: extract from S3 URI
+    if video_id == 'unknown' and video_s3_uri and video_s3_uri.startswith('s3://'):
+        extracted_id = video_s3_uri.split('/')[-1]
+        if '.' in extracted_id:
+            video_id = extracted_id.rsplit('.', 1)[0]
+        else:
+            video_id = extracted_id
     
     import time
     start_time = time.time()
@@ -515,13 +380,36 @@ def store_embeddings_to_opensearch(bedrock_response, embedding_data_list):
     if not isinstance(embedding_data_list, list):
         embedding_data_list = [embedding_data_list]
     
+    # Skip if this (userId, videoId) pair is already indexed to avoid duplicates
+    # on re-runs (OpenSearch Serverless does not support explicit doc IDs / upsert).
+    try:
+        probe = opensearch.search(index='video-embeddings', body={
+            "size": 1,
+            "query": {"bool": {"filter": [
+                {"term": {"userId": user_id or 'unknown'}},
+                {"term": {"videoId": video_id}},
+            ]}},
+            "_source": False,
+        })
+        if probe.get('hits', {}).get('total', {}).get('value', 0) > 0:
+            print(f"OpenSearch: skip re-index for {user_id}/{video_id} (already has docs)")
+            return {
+                'stored_count': 0,
+                'video_id': video_id,
+                'skipped': True,
+                'storage_time_ms': round((time.time() - start_time) * 1000, 2)
+            }
+    except Exception as e:
+        print(f"Duplicate probe failed (will proceed): {e}")
+
     # Store each temporal segment as a separate document
     for i, embedding_data in enumerate(embedding_data_list):
         # Create unique document ID for each segment
         segment_id = f"{video_id}_segment_{i}_{embedding_data.get('startSec', 0)}"
-        
+
         # Prepare document for OpenSearch
         document = {
+            'userId': user_id or 'unknown',
             'videoId': video_id,
             'videoS3Uri': video_s3_uri,
             'segmentId': segment_id,
@@ -594,29 +482,20 @@ def handle_flush_opensearch(event: Dict[str, Any], cors_headers: Dict[str, str])
         except Exception as e:
             print(f"Could not get document count: {e}")
             total_docs = "unknown"
-        
-        # Delete all documents using delete_by_query
-        delete_response = opensearch.delete_by_query(
-            index=index_name,
-            body={
-                "query": {
-                    "match_all": {}
-                }
-            },
-            refresh=True  # Refresh the index after deletion
-        )
-        
-        deleted_count = delete_response.get('deleted', 0)
-        print(f"Successfully deleted {deleted_count} documents from {index_name}")
-        
+
+        # Delete entire index and recreate (delete_by_query not supported on AOSS)
+        opensearch.indices.delete(index=index_name)
+        print(f"Deleted index {index_name}")
+        ensure_vector_index(opensearch)
+        print(f"Recreated index {index_name}")
+
         return {
             'statusCode': 200,
             'headers': cors_headers,
             'body': json.dumps({
                 'message': f'Successfully flushed OpenSearch index {index_name}',
                 'documents_before': total_docs,
-                'documents_deleted': deleted_count,
-                'took_ms': delete_response.get('took', 0)
+                'documents_deleted': total_docs
             })
         }
         
@@ -640,7 +519,8 @@ def process_analysis_async(event: Dict[str, Any]) -> Dict[str, Any]:
         prompt = event.get('prompt')
         video_id = event.get('videoId')
         bucket_name = event.get('bucketName')
-        
+        user_id = event.get('userId', 'anonymous')
+
         print(f"Processing async analysis - Job ID: {analysis_job_id}")
         print(f"S3 URI: {s3_uri}, Video ID: {video_id}")
         print(f"Prompt length: {len(prompt) if prompt else 0}")
@@ -667,7 +547,7 @@ def process_analysis_async(event: Dict[str, Any]) -> Dict[str, Any]:
         print(f"Calling Bedrock Pegasus model with request: {json.dumps(request_body, indent=2)}")
         
         response = bedrock_client.invoke_model(
-            modelId='us.twelvelabs.pegasus-1-2-v1:0',
+            modelId='twelvelabs.pegasus-1-2-v1:0',
             body=json.dumps(request_body),
             contentType='application/json'
         )
@@ -691,7 +571,7 @@ def process_analysis_async(event: Dict[str, Any]) -> Dict[str, Any]:
         }
         
         # Store completed result
-        result_key = f"analysis/{analysis_job_id}/result.json"
+        result_key = f"analysis/{user_id}/{analysis_job_id}/result.json"
         s3_client.put_object(
             Bucket=bucket_name,
             Key=result_key,
@@ -700,7 +580,7 @@ def process_analysis_async(event: Dict[str, Any]) -> Dict[str, Any]:
         )
         
         # Update job status
-        job_key = f"analysis/{analysis_job_id}/job_info.json"
+        job_key = f"analysis/{user_id}/{analysis_job_id}/job_info.json"
         job_info = {
             'jobId': analysis_job_id,
             'status': 'Completed',
@@ -718,6 +598,26 @@ def process_analysis_async(event: Dict[str, Any]) -> Dict[str, Any]:
             ContentType='application/json'
         )
         
+        # Update analysis record in DDB
+        try:
+            analysis_sort_key = event.get('analysisSortKey')
+            if analysis_sort_key:
+                table = get_metadata_table()
+                if table:
+                    table.update_item(
+                        Key={'userId': user_id, 'sortKey': analysis_sort_key},
+                        UpdateExpression='SET #s = :s, analysis = :a, completedAt = :t, completedAtISO = :iso',
+                        ExpressionAttributeNames={'#s': 'status'},
+                        ExpressionAttributeValues={
+                            ':s': 'Completed',
+                            ':a': response_body.get('message', ''),
+                            ':t': int(time.time()),
+                            ':iso': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
+                        }
+                    )
+        except Exception as e:
+            print(f"Failed to update analysis record in DDB: {e}")
+
         print(f"Analysis completed and stored at s3://{bucket_name}/{result_key}")
         print(f"Processing time: {time.time() - start_time:.2f} seconds")
         print("=== ASYNC ANALYSIS PROCESSING END ===")
@@ -739,7 +639,7 @@ def process_analysis_async(event: Dict[str, Any]) -> Dict[str, Any]:
         # Update job status to failed if we have the required info
         if 'analysis_job_id' in locals() and 'bucket_name' in locals():
             try:
-                job_key = f"analysis/{analysis_job_id}/job_info.json"
+                job_key = f"analysis/{user_id}/{analysis_job_id}/job_info.json"
                 failed_job_info = {
                     'jobId': analysis_job_id,
                     'status': 'Failed',
@@ -756,7 +656,21 @@ def process_analysis_async(event: Dict[str, Any]) -> Dict[str, Any]:
                 print(f"Updated job status to failed in S3")
             except Exception as update_error:
                 print(f"Failed to update job status: {update_error}")
-        
+
+        try:
+            analysis_sort_key = event.get('analysisSortKey')
+            if analysis_sort_key and 'user_id' in locals():
+                table = get_metadata_table()
+                if table:
+                    table.update_item(
+                        Key={'userId': user_id, 'sortKey': analysis_sort_key},
+                        UpdateExpression='SET #s = :s, #err = :e',
+                        ExpressionAttributeNames={'#s': 'status', '#err': 'error'},
+                        ExpressionAttributeValues={':s': 'Failed', ':e': str(e)}
+                    )
+        except Exception as ddb_error:
+            print(f"Failed to update analysis status in DDB: {ddb_error}")
+
         print("=== ASYNC ANALYSIS PROCESSING END (ERROR) ===")
         return {
             'statusCode': 500,
@@ -773,6 +687,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     if 'action' in event and event.get('action') == 'process_analysis':
         print("Processing async analysis request")
         return process_analysis_async(event)
+
+    if event.get('internalAction') == 'embed_shared_sample':
+        process_shared_sample_embedding(event['s3Uri'], event['videoId'], event.get('queue', []))
+        return {'status': 'ok'}
     
     print(f"Received event: {event.get('httpMethod')} {event.get('path')}")
     event_body = event.get('body', 'No body')
@@ -825,6 +743,18 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         elif path == '/flush-opensearch' and method == 'POST':
             print("Routing to handle_flush_opensearch")
             return handle_flush_opensearch(event, cors_headers)
+        elif path == '/videos' and method == 'GET':
+            print("Routing to handle_list_videos")
+            return handle_list_videos(event, cors_headers)
+        elif path == '/analyses' and method == 'GET':
+            print("Routing to handle_list_analyses")
+            return handle_list_analyses(event, cors_headers)
+        elif path == '/embeddings' and method == 'GET':
+            print("Routing to handle_list_embeddings")
+            return handle_list_embeddings(event, cors_headers)
+        elif path == '/admin/index-samples' and method == 'POST':
+            print("Routing to handle_index_samples")
+            return handle_index_samples(event, cors_headers)
         else:
             print(f"No route found for {method} {path}")
             return {
@@ -958,7 +888,18 @@ def handle_upload(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[s
             }
         
         bucket_name = os.environ.get('VIDEO_BUCKET')
-        key = f"videos/{filename}"
+        user_id = get_user_id(event)
+        key = f"videos/{user_id}/{filename}"
+
+        try:
+            s3_client.head_object(Bucket=bucket_name, Key=key)
+            return {
+                'statusCode': 409,
+                'headers': cors_headers,
+                'body': json.dumps({'error': f'File "{filename}" already exists. Please rename and try again.'})
+            }
+        except ClientError:
+            pass
         
         # Generate presigned POST instead of PUT
         presigned_post = s3_client.generate_presigned_post(
@@ -971,7 +912,25 @@ def handle_upload(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[s
             ],
             ExpiresIn=3600
         )
-        
+
+        # Save video metadata to DDB
+        try:
+            table = get_metadata_table()
+            if table:
+                table.put_item(Item={
+                    'userId': user_id,
+                    'sortKey': f'VIDEO#{key}',
+                    'filename': filename,
+                    's3Uri': f's3://{bucket_name}/{key}',
+                    'bucket': bucket_name,
+                    'key': key,
+                    'contentType': content_type,
+                    'uploadedAt': int(time.time()),
+                    'uploadedAtISO': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
+                })
+        except Exception as e:
+            print(f"Failed to save video metadata to DDB: {e}")
+
         return {
             'statusCode': 200,
             'headers': cors_headers,
@@ -1033,14 +992,15 @@ def wait_for_s3_object(s3_uri: str, max_wait_seconds: int = 30) -> bool:
     print(f"S3 object not found after waiting {max_wait_seconds} seconds")
     return False
 
-def handle_analysis_status(analysis_job_id: str, cors_headers: Dict[str, str]) -> Dict[str, Any]:
+def handle_analysis_status(analysis_job_id: str, cors_headers: Dict[str, str], event: Dict[str, Any]) -> Dict[str, Any]:
     """Check status of Pegasus analysis job and retrieve results from S3"""
     try:
         print(f"Checking analysis status for job: {analysis_job_id}")
-        
+
         bucket_name = os.environ.get('VIDEO_BUCKET')
-        job_key = f"analysis/{analysis_job_id}/job_info.json"
-        result_key = f"analysis/{analysis_job_id}/result.json"
+        user_id = get_user_id(event)
+        job_key = f"analysis/{user_id}/{analysis_job_id}/job_info.json"
+        result_key = f"analysis/{user_id}/{analysis_job_id}/result.json"
         
         # First, check if job info exists
         try:
@@ -1133,6 +1093,9 @@ def handle_analysis_status(analysis_job_id: str, cors_headers: Dict[str, str]) -
 
 def handle_analyze(event: Dict[str, Any], cors_headers: Dict[str, str], context: Any) -> Dict[str, Any]:
     """Handle video analysis using Twelve Labs Pegasus - start analysis and return job ID"""
+    limit_err = check_and_increment_usage(get_user_id(event), 'analyzeCount', cors_headers)
+    if limit_err:
+        return limit_err
     try:
         print("Starting video analysis...")
         body = json.loads(event.get('body', '{}'))
@@ -1176,7 +1139,8 @@ def handle_analyze(event: Dict[str, Any], cors_headers: Dict[str, str], context:
         
         # Store job info in S3 first
         bucket_name = os.environ.get('VIDEO_BUCKET')
-        job_key = f"analysis/{analysis_job_id}/job_info.json"
+        user_id = get_user_id(event)
+        job_key = f"analysis/{user_id}/{analysis_job_id}/job_info.json"
         
         try:
             s3_client.put_object(
@@ -1193,10 +1157,29 @@ def handle_analyze(event: Dict[str, Any], cors_headers: Dict[str, str], context:
                 'headers': cors_headers,
                 'body': json.dumps({'error': f'Failed to initialize analysis job: {str(e)}'})
             }
-        
+
+        # Save analysis record to DDB
+        analysis_sort_key = f'ANALYSIS#{video_id}#{int(time.time())}'
+        try:
+            table = get_metadata_table()
+            if table:
+                table.put_item(Item={
+                    'userId': user_id,
+                    'sortKey': analysis_sort_key,
+                    'videoId': video_id,
+                    'jobId': analysis_job_id,
+                    'prompt': prompt,
+                    's3Uri': s3_uri,
+                    'status': 'InProgress',
+                    'createdAt': int(time.time()),
+                    'createdAtISO': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
+                })
+        except Exception as e:
+            print(f"Failed to save analysis record to DDB: {e}")
+
         # Invoke Lambda asynchronously to process the analysis
         try:
-            lambda_client = boto3.client('lambda', region_name=os.environ.get('REGION', 'us-east-1'))
+            lambda_client = boto3.client('lambda', region_name=os.environ.get('REGION', 'ap-northeast-2'))
             function_name = os.environ.get('LAMBDA_FUNCTION_NAME') or context.function_name
             
             # Create payload for async processing
@@ -1206,7 +1189,9 @@ def handle_analyze(event: Dict[str, Any], cors_headers: Dict[str, str], context:
                 's3Uri': s3_uri,
                 'prompt': prompt,
                 'videoId': video_id,
-                'bucketName': bucket_name
+                'bucketName': bucket_name,
+                'userId': user_id,
+                'analysisSortKey': analysis_sort_key
             }
             
             print(f"Invoking Lambda function asynchronously for job {analysis_job_id}")
@@ -1285,6 +1270,9 @@ def handle_analyze(event: Dict[str, Any], cors_headers: Dict[str, str], context:
 
 def handle_embed(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[str, Any]:
     """Handle video embedding generation using Twelve Labs Marengo (async)"""
+    limit_err = check_and_increment_usage(get_user_id(event), 'embedCount', cors_headers)
+    if limit_err:
+        return limit_err
     try:
         print("Starting embedding generation...")
         body = json.loads(event.get('body', '{}'))
@@ -1309,18 +1297,25 @@ def handle_embed(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[st
                 'body': json.dumps({'error': 'Video file not found in S3. Please ensure the upload completed successfully.'})
             }
         
-        # Use async invoke for Marengo with temporal segmentation
+        # Use async invoke for Marengo 3.0 with temporal segmentation
         model_input = {
             "inputType": "video",
-            "mediaSource": {
-                "s3Location": {
-                    "uri": s3_uri,
-                    "bucketOwner": get_account_id()
-                }
-            },
-            "useFixedLengthSec": 10,  # 10-second segments for better temporal granularity
-            "embeddingOption": ["visual-text", "audio"],  # Get both visual and audio embeddings
-            "minClipSec": 2  # Minimum clip duration
+            "video": {
+                "mediaSource": {
+                    "s3Location": {
+                        "uri": s3_uri,
+                        "bucketOwner": get_account_id()
+                    }
+                },
+                "segmentation": {
+                    "method": "fixed",
+                    "fixed": {
+                        "durationSec": 10
+                    }
+                },
+                "embeddingOption": ["visual", "audio"],
+                "embeddingScope": ["clip"]
+            }
         }
         
         print(f"Calling Bedrock Marengo model with input: {json.dumps(model_input, indent=2)}")
@@ -1337,13 +1332,14 @@ def handle_embed(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[st
             safe_video_id = safe_video_id.rsplit('.', 1)[0]  # Remove extension for folder name
         safe_video_id = safe_video_id.replace('/', '_').replace(' ', '_')  # Make filesystem safe
         
+        user_id = get_user_id(event)
         print(f"🔍 DEBUG: Original video_id: '{video_id}', clean_video_id: '{clean_video_id}', safe_video_id: '{safe_video_id}'")
         response = bedrock_client.start_async_invoke(
-            modelId='twelvelabs.marengo-embed-2-7-v1:0',
+            modelId='twelvelabs.marengo-embed-3-0-v1:0',
             modelInput=model_input,
             outputDataConfig={
                 's3OutputDataConfig': {
-                    's3Uri': f"s3://{os.environ.get('VIDEO_BUCKET')}/embeddings/{safe_video_id}/"
+                    's3Uri': f"s3://{os.environ.get('VIDEO_BUCKET')}/embeddings/{user_id}/{safe_video_id}/"
                 }
             }
         )
@@ -1352,7 +1348,24 @@ def handle_embed(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[st
         
         invocation_arn = response.get('invocationArn')
         print(f"Successfully started embedding generation with ARN: {invocation_arn}")
-        
+
+        # Save embedding record to DDB
+        try:
+            table = get_metadata_table()
+            if table:
+                table.put_item(Item={
+                    'userId': user_id,
+                    'sortKey': f'EMBEDDING#{video_id}',
+                    'videoId': video_id,
+                    's3Uri': s3_uri,
+                    'invocationArn': invocation_arn,
+                    'status': 'processing',
+                    'createdAt': int(time.time()),
+                    'createdAtISO': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
+                })
+        except Exception as e:
+            print(f"Failed to save embedding record to DDB: {e}")
+
         return {
             'statusCode': 202,
             'headers': cors_headers,
@@ -1362,7 +1375,7 @@ def handle_embed(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[st
                 'message': 'Embedding generation started'
             })
         }
-    
+
     except json.JSONDecodeError as e:
         print(f"JSON decode error in embed: {e}")
         return {
@@ -1401,7 +1414,7 @@ def handle_status(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[s
         
         # Handle analysis job status check
         if analysis_job_id:
-            return handle_analysis_status(analysis_job_id, cors_headers)
+            return handle_analysis_status(analysis_job_id, cors_headers, event)
         
         # Handle embedding status check (existing functionality)
         if not invocation_arn:
@@ -1438,34 +1451,75 @@ def handle_status(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[s
                     result_data = json.loads(s3_response['Body'].read())
                     print(f"Retrieved result data structure: {list(result_data.keys())}")
                     
-                    # Store embeddings to both OpenSearch and S3 Vectors
+                    # Look up original s3Uri from DDB
+                    original_s3_uri = None
+                    try:
+                        embed_user = get_user_id(event)
+                        tbl = get_metadata_table()
+                        if tbl:
+                            ddb_resp = tbl.query(
+                                KeyConditionExpression='userId = :uid AND begins_with(sortKey, :prefix)',
+                                ExpressionAttributeValues={':uid': embed_user, ':prefix': 'EMBEDDING#'},
+                            )
+                            for itm in ddb_resp.get('Items', []):
+                                if itm.get('invocationArn') == invocation_arn:
+                                    original_s3_uri = itm.get('s3Uri', '')
+                                    print(f"Found original s3Uri from DDB: {original_s3_uri}")
+                                    break
+                    except Exception as ddb_e:
+                        print(f"Failed to lookup original s3Uri from DDB: {ddb_e}")
+
+                    # Store embeddings to OpenSearch
                     storage_result = None
                     if 'data' in result_data and result_data['data']:
                         try:
-                            print("Storing embeddings to both OpenSearch and S3 Vectors...")
-                            storage_result = store_embeddings_dual(response, result_data['data'])
-                            print(f"Dual storage result: {storage_result}")
+                            print("Storing embeddings to OpenSearch...")
+                            embed_uid = get_user_id(event)
+                            storage_result = store_embeddings_to_opensearch(response, result_data['data'], original_s3_uri=original_s3_uri, user_id=embed_uid)
+                            print(f"OpenSearch storage result: {storage_result}")
                         except Exception as e:
                             print(f"Failed to store embeddings: {e}")
                             storage_result = {'error': str(e)}
-                    
+
                     # Return minimal data to avoid 413 error
                     segments_count = len(result_data.get('data', [])) if 'data' in result_data else 0
-                    
+
+                    # Update embedding status in DDB
+                    try:
+                        embed_user_id = get_user_id(event)
+                        vid_id = storage_result.get('video_id', 'unknown') if isinstance(storage_result, dict) else 'unknown'
+                        table = get_metadata_table()
+                        if table and vid_id != 'unknown':
+                            response_ddb = table.query(
+                                KeyConditionExpression='userId = :uid AND begins_with(sortKey, :prefix)',
+                                ExpressionAttributeValues={':uid': embed_user_id, ':prefix': 'EMBEDDING#'},
+                            )
+                            for item in response_ddb.get('Items', []):
+                                if item.get('invocationArn') == invocation_arn:
+                                    table.update_item(
+                                        Key={'userId': embed_user_id, 'sortKey': item['sortKey']},
+                                        UpdateExpression='SET #s = :s, segmentsCount = :sc, completedAt = :t, completedAtISO = :iso',
+                                        ExpressionAttributeNames={'#s': 'status'},
+                                        ExpressionAttributeValues={
+                                            ':s': 'completed',
+                                            ':sc': segments_count,
+                                            ':t': int(time.time()),
+                                            ':iso': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
+                                        }
+                                    )
+                                    break
+                    except Exception as e:
+                        print(f"Failed to update embedding status in DDB: {e}")
+
                     return {
                         'statusCode': 200,
                         'headers': cors_headers,
                         'body': json.dumps({
                             'status': status,
                             'segments_processed': segments_count,
-                            'opensearch_stored': storage_result.get('opensearch', {}).get('stored_count', 0) if isinstance(storage_result, dict) else 0,
-                            's3vectors_stored': storage_result.get('s3vectors', {}).get('stored_count', 0) if isinstance(storage_result, dict) else 0,
+                            'opensearch_stored': storage_result.get('stored_count', 0) if isinstance(storage_result, dict) else 0,
                             'video_id': storage_result.get('video_id', 'unknown') if isinstance(storage_result, dict) else 'unknown',
-                            'storage_times': {
-                                'opensearch_ms': storage_result.get('opensearch', {}).get('storage_time_ms', 0) if isinstance(storage_result, dict) else 0,
-                                's3vectors_ms': storage_result.get('s3vectors', {}).get('storage_time_ms', 0) if isinstance(storage_result, dict) else 0
-                            },
-                            'message': f'Embedding completed with {segments_count} segments stored to both systems'
+                            'message': f'Embedding completed with {segments_count} segments stored'
                         })
                     }
                 except Exception as e:
@@ -1518,6 +1572,9 @@ def handle_status(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[s
 
 def handle_search(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[str, Any]:
     """Handle vector similarity search"""
+    limit_err = check_and_increment_usage(get_user_id(event), 'searchCount', cors_headers)
+    if limit_err:
+        return limit_err
     try:
         print("Starting search request...")
         query_params = event.get('queryStringParameters', {}) or {}
@@ -1531,20 +1588,23 @@ def handle_search(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[s
                 'body': json.dumps({'error': 'Query parameter q is required'})
             }
         
-        # Generate embedding for query text using Marengo (async)
+        # Generate embedding for query text using Marengo 3.0
         model_input = {
             "inputType": "text",
-            "inputText": query_text
+            "text": {
+                "inputText": query_text
+            }
         }
         
         try:
+            user_id = get_user_id(event)
             print("Starting async query embedding generation...")
             response = bedrock_client.start_async_invoke(
-                modelId='twelvelabs.marengo-embed-2-7-v1:0',
+                modelId='twelvelabs.marengo-embed-3-0-v1:0',
                 modelInput=model_input,
                 outputDataConfig={
                     's3OutputDataConfig': {
-                        's3Uri': f"s3://{os.environ.get('VIDEO_BUCKET')}/search-embeddings/"
+                        's3Uri': f"s3://{os.environ.get('VIDEO_BUCKET')}/search-embeddings/{user_id}/"
                     }
                 }
             )
@@ -1610,48 +1670,26 @@ def handle_search(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[s
                 'body': json.dumps({'error': f'Failed to generate embedding: {str(e)}'})
             }
         
-        # Search both OpenSearch and S3 Vectors in parallel for comparison
-        print("Starting dual search: OpenSearch vs S3 Vectors...")
-        
-        opensearch_result = {}
-        s3vectors_result = {}
-        
-        # Search OpenSearch
+        # Search OpenSearch only
         try:
-            print("Searching OpenSearch...")
-            opensearch_result = search_opensearch(query_embedding, top_k=10)
+            search_result = search_opensearch(query_embedding, top_k=10, user_id=get_user_id(event))
         except Exception as e:
-            print(f"OpenSearch search failed: {e}")
-            opensearch_result = {
+            search_result = {
                 'results': [],
                 'total': 0,
                 'search_time_ms': 0,
                 'error': str(e)
             }
-        
-        # Search S3 Vectors
-        try:
-            print("Searching S3 Vectors...")
-            s3vectors_result = search_s3_vectors(query_embedding, top_k=10)
-        except Exception as e:
-            print(f"S3 Vectors search failed: {e}")
-            s3vectors_result = {
-                'results': [],
-                'total': 0,
-                'search_time_ms': 0,
-                'error': str(e)
-            }
-        
+
         return {
             'statusCode': 200,
             'headers': cors_headers,
             'body': json.dumps({
-                'comparison': {
-                    'opensearch': opensearch_result,
-                    's3vectors': s3vectors_result
-                },
+                'results': search_result.get('results', []),
+                'total': search_result.get('total', 0),
+                'search_time_ms': search_result.get('search_time_ms', 0),
                 'query': query_text,
-                'message': 'Dual search completed - compare OpenSearch vs S3 Vectors performance and results'
+                'message': search_result.get('message', f'Found {search_result.get("total", 0)} results')
             })
         }
     
@@ -1662,3 +1700,329 @@ def handle_search(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[s
             'headers': cors_headers,
             'body': json.dumps({'error': str(e)})
         }
+
+def handle_list_videos(event, cors_headers):
+    """List all uploaded videos for the current user, plus shared videos"""
+    try:
+        user_id = get_user_id(event)
+        table = get_metadata_table()
+        if not table:
+            return {'statusCode': 500, 'headers': cors_headers, 'body': json.dumps({'error': 'Metadata table not configured'})}
+
+        def query_videos(uid, is_shared):
+            resp = table.query(
+                KeyConditionExpression='userId = :uid AND begins_with(sortKey, :prefix)',
+                ExpressionAttributeValues={':uid': uid, ':prefix': 'VIDEO#'},
+                ScanIndexForward=False,
+            )
+            out = []
+            for item in resp.get('Items', []):
+                out.append({
+                    'key': item.get('key', ''),
+                    'filename': item.get('filename', ''),
+                    's3Uri': item.get('s3Uri', ''),
+                    'bucket': item.get('bucket', ''),
+                    'contentType': item.get('contentType', ''),
+                    'uploadedAt': item.get('uploadedAtISO', ''),
+                    'isShared': is_shared,
+                })
+            return out
+
+        videos = query_videos(user_id, False)
+        if user_id != SHARED_USER_ID:
+            videos.extend(query_videos(SHARED_USER_ID, True))
+
+        return {
+            'statusCode': 200,
+            'headers': cors_headers,
+            'body': json.dumps({'videos': videos}, default=decimal_default)
+        }
+    except Exception as e:
+        print(f"Error listing videos: {e}")
+        return {'statusCode': 500, 'headers': cors_headers, 'body': json.dumps({'error': str(e)})}
+
+def handle_index_samples(event, cors_headers):
+    """Admin-only: enumerate sample videos and kick off a serial embedding chain.
+    Only the first sample gets invoked; each Lambda chains into the next after
+    finishing, so only one embedding runs at a time."""
+    if not is_admin(event):
+        return {
+            'statusCode': 403,
+            'headers': cors_headers,
+            'body': json.dumps({'error': 'Admin only'})
+        }
+    try:
+        bucket_name = os.environ.get('VIDEO_BUCKET')
+        prefix = 'videos/samples/'
+        paginator = s3_client.get_paginator('list_objects_v2')
+        sample_keys = []
+        for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
+            for obj in page.get('Contents', []):
+                key = obj['Key']
+                if key == prefix or not key.lower().endswith('.mp4'):
+                    continue
+                filename = key[len(prefix):]
+                if '/' in filename:
+                    continue
+                sample_keys.append(filename)
+        sample_keys.sort()
+
+        table = get_metadata_table()
+        for filename in sample_keys:
+            dest_key = f'videos/{SHARED_USER_ID}/{filename}'
+            try:
+                s3_client.head_object(Bucket=bucket_name, Key=dest_key)
+            except ClientError:
+                s3_client.copy_object(
+                    Bucket=bucket_name,
+                    Key=dest_key,
+                    CopySource={'Bucket': bucket_name, 'Key': f'{prefix}{filename}'},
+                    MetadataDirective='COPY',
+                )
+            if table:
+                try:
+                    table.put_item(Item={
+                        'userId': SHARED_USER_ID,
+                        'sortKey': f'VIDEO#{dest_key}',
+                        'filename': filename,
+                        's3Uri': f's3://{bucket_name}/{dest_key}',
+                        'bucket': bucket_name,
+                        'key': dest_key,
+                        'contentType': 'video/mp4',
+                        'uploadedAt': int(time.time()),
+                        'uploadedAtISO': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
+                        'source': 'sample',
+                    })
+                except Exception as e:
+                    print(f"DDB put for shared video failed: {e}")
+
+        if not sample_keys:
+            return {'statusCode': 200, 'headers': cors_headers, 'body': json.dumps({'message': 'No samples to index'})}
+
+        lambda_client = boto3.client('lambda', region_name=os.environ.get('REGION', 'ap-northeast-2'))
+        function_name = os.environ.get('AWS_LAMBDA_FUNCTION_NAME')
+        first, rest = sample_keys[0], sample_keys[1:]
+        payload = {
+            'internalAction': 'embed_shared_sample',
+            's3Uri': f's3://{bucket_name}/videos/{SHARED_USER_ID}/{first}',
+            'videoId': first,
+            'queue': rest,
+        }
+        lambda_client.invoke(
+            FunctionName=function_name,
+            InvocationType='Event',
+            Payload=json.dumps(payload).encode('utf-8'),
+        )
+
+        return {
+            'statusCode': 200,
+            'headers': cors_headers,
+            'body': json.dumps({
+                'message': f'Started serial embedding chain: {first} then {len(rest)} more',
+                'samples': sample_keys,
+            })
+        }
+    except Exception as e:
+        print(f"index-samples failed: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return {'statusCode': 500, 'headers': cors_headers, 'body': json.dumps({'error': str(e)})}
+
+def process_shared_sample_embedding(s3_uri: str, video_id: str, queue=None):
+    """Run synchronously inside an async-invoked Lambda: start Marengo embedding,
+    poll until it completes, and persist results to OpenSearch under SHARED_USER_ID.
+    When finished, kick off the next sample in `queue` to keep processing serial."""
+    print(f"[shared-embed] starting for {s3_uri}  queue_left={len(queue or [])}")
+
+    safe_video_id = video_id.rsplit('.', 1)[0] if '.' in video_id else video_id
+    safe_video_id = safe_video_id.replace('/', '_').replace(' ', '_')
+
+    model_input = {
+        "inputType": "video",
+        "video": {
+            "mediaSource": {
+                "s3Location": {
+                    "uri": s3_uri,
+                    "bucketOwner": get_account_id()
+                }
+            },
+            "segmentation": {
+                "method": "fixed",
+                "fixed": {"durationSec": 10}
+            },
+            "embeddingOption": ["visual", "audio"],
+            "embeddingScope": ["clip"]
+        }
+    }
+
+    bucket_name = os.environ.get('VIDEO_BUCKET')
+    response = bedrock_client.start_async_invoke(
+        modelId='twelvelabs.marengo-embed-3-0-v1:0',
+        modelInput=model_input,
+        outputDataConfig={
+            's3OutputDataConfig': {
+                's3Uri': f"s3://{bucket_name}/embeddings/{SHARED_USER_ID}/{safe_video_id}/"
+            }
+        }
+    )
+    invocation_arn = response.get('invocationArn')
+    print(f"[shared-embed] arn={invocation_arn}")
+
+    table = get_metadata_table()
+    if table:
+        try:
+            table.put_item(Item={
+                'userId': SHARED_USER_ID,
+                'sortKey': f'EMBEDDING#{video_id}',
+                'videoId': video_id,
+                's3Uri': s3_uri,
+                'invocationArn': invocation_arn,
+                'status': 'processing',
+                'createdAt': int(time.time()),
+                'createdAtISO': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
+            })
+        except Exception as e:
+            print(f"[shared-embed] DDB embed record failed: {e}")
+
+    max_wait = 14 * 60
+    waited = 0
+    output_s3_uri = None
+    status = None
+    while waited < max_wait:
+        status_resp = bedrock_client.get_async_invoke(invocationArn=invocation_arn)
+        status = status_resp.get('status')
+        print(f"[shared-embed] status={status} waited={waited}s")
+        if status == 'Completed':
+            output_s3_uri = status_resp.get('outputDataConfig', {}).get('s3OutputDataConfig', {}).get('s3Uri')
+            break
+        if status in ('Failed', 'Cancelled'):
+            raise RuntimeError(f"Marengo embedding {status}")
+        time.sleep(10)
+        waited += 10
+
+    if not output_s3_uri:
+        raise RuntimeError('Embedding timed out')
+
+    uri_parts = output_s3_uri.replace('s3://', '').split('/')
+    out_bucket = uri_parts[0]
+    out_key = '/'.join(uri_parts[1:]) + '/output.json'
+    result_data = json.loads(s3_client.get_object(Bucket=out_bucket, Key=out_key)['Body'].read())
+
+    if 'data' in result_data and result_data['data']:
+        store_embeddings_to_opensearch(
+            status_resp,
+            result_data['data'],
+            original_s3_uri=s3_uri,
+            user_id=SHARED_USER_ID,
+        )
+        print(f"[shared-embed] stored {len(result_data['data'])} segments for {video_id}")
+
+    if table:
+        try:
+            table.update_item(
+                Key={'userId': SHARED_USER_ID, 'sortKey': f'EMBEDDING#{video_id}'},
+                UpdateExpression='SET #s = :s, completedAt = :t',
+                ExpressionAttributeNames={'#s': 'status'},
+                ExpressionAttributeValues={':s': 'completed', ':t': int(time.time())},
+            )
+        except Exception as e:
+            print(f"[shared-embed] DDB status update failed: {e}")
+
+    if queue:
+        next_filename = queue[0]
+        rest = queue[1:]
+        try:
+            lambda_client = boto3.client('lambda', region_name=os.environ.get('REGION', 'ap-northeast-2'))
+            lambda_client.invoke(
+                FunctionName=os.environ.get('AWS_LAMBDA_FUNCTION_NAME'),
+                InvocationType='Event',
+                Payload=json.dumps({
+                    'internalAction': 'embed_shared_sample',
+                    's3Uri': f"s3://{os.environ.get('VIDEO_BUCKET')}/videos/{SHARED_USER_ID}/{next_filename}",
+                    'videoId': next_filename,
+                    'queue': rest,
+                }).encode('utf-8'),
+            )
+            print(f"[shared-embed] chained next={next_filename} remaining={len(rest)}")
+        except Exception as e:
+            print(f"[shared-embed] chain invoke failed: {e}")
+
+def handle_list_analyses(event, cors_headers):
+    """List analysis history for a video"""
+    try:
+        user_id = get_user_id(event)
+        query_params = event.get('queryStringParameters', {}) or {}
+        video_id = query_params.get('videoId', '')
+
+        table = get_metadata_table()
+        if not table:
+            return {'statusCode': 500, 'headers': cors_headers, 'body': json.dumps({'error': 'Metadata table not configured'})}
+
+        if video_id:
+            prefix = f'ANALYSIS#{video_id}'
+        else:
+            prefix = 'ANALYSIS#'
+
+        response = table.query(
+            KeyConditionExpression='userId = :uid AND begins_with(sortKey, :prefix)',
+            ExpressionAttributeValues={':uid': user_id, ':prefix': prefix},
+            ScanIndexForward=False,
+        )
+
+        analyses = []
+        for item in response.get('Items', []):
+            analyses.append({
+                'jobId': item.get('jobId', ''),
+                'videoId': item.get('videoId', ''),
+                'prompt': item.get('prompt', ''),
+                'status': item.get('status', ''),
+                'analysis': item.get('analysis', ''),
+                'error': item.get('error', ''),
+                'createdAt': item.get('createdAtISO', ''),
+                'completedAt': item.get('completedAtISO', ''),
+            })
+
+        return {
+            'statusCode': 200,
+            'headers': cors_headers,
+            'body': json.dumps({'analyses': analyses}, default=decimal_default)
+        }
+    except Exception as e:
+        print(f"Error listing analyses: {e}")
+        return {'statusCode': 500, 'headers': cors_headers, 'body': json.dumps({'error': str(e)})}
+
+def handle_list_embeddings(event, cors_headers):
+    """List embedding statuses for all user's videos"""
+    try:
+        user_id = get_user_id(event)
+        table = get_metadata_table()
+        if not table:
+            return {'statusCode': 500, 'headers': cors_headers, 'body': json.dumps({'error': 'Metadata table not configured'})}
+
+        response = table.query(
+            KeyConditionExpression='userId = :uid AND begins_with(sortKey, :prefix)',
+            ExpressionAttributeValues={':uid': user_id, ':prefix': 'EMBEDDING#'},
+            ScanIndexForward=False,
+        )
+
+        embeddings = []
+        for item in response.get('Items', []):
+            embeddings.append({
+                'videoId': item.get('videoId', ''),
+                's3Uri': item.get('s3Uri', ''),
+                'status': item.get('status', ''),
+                'invocationArn': item.get('invocationArn', ''),
+                'segmentsCount': int(item.get('segmentsCount', 0)),
+                'createdAt': item.get('createdAtISO', ''),
+                'completedAt': item.get('completedAtISO', ''),
+            })
+
+        return {
+            'statusCode': 200,
+            'headers': cors_headers,
+            'body': json.dumps({'embeddings': embeddings}, default=decimal_default)
+        }
+    except Exception as e:
+        print(f"Error listing embeddings: {e}")
+        return {'statusCode': 500, 'headers': cors_headers, 'body': json.dumps({'error': str(e)})}
+# deploy test
