@@ -3,9 +3,10 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as iam from 'aws-cdk-lib/aws-iam';
-import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
-import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
+import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as opensearchserverless from 'aws-cdk-lib/aws-opensearchserverless';
+import * as cognito from 'aws-cdk-lib/aws-cognito';
+import * as amplify from 'aws-cdk-lib/aws-amplify';
 import { Construct } from 'constructs';
 import * as path from 'path';
 
@@ -26,66 +27,61 @@ export class InfrastructureStack extends cdk.Stack {
             s3.HttpMethods.DELETE,
             s3.HttpMethods.HEAD,
           ],
-          allowedOrigins: ['http://localhost:3000', 'https://localhost:3000'],
+          allowedOrigins: ['*'],
           exposedHeaders: ['ETag'],
         },
       ],
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // CloudFront Origin Access Control
-    const originAccessControl = new cloudfront.CfnOriginAccessControl(this, 'VideoOAC', {
-      originAccessControlConfig: {
-        description: 'OAC for video streaming',
-        name: 'VideoUnderstandingStackVideoOAC09953FB6',
-        originAccessControlOriginType: 's3',
-        signingBehavior: 'always',
-        signingProtocol: 'sigv4',
+    // DynamoDB metadata table
+    const metadataTable = new dynamodb.Table(this, 'MetadataTable', {
+      tableName: `video-understanding-metadata-${this.region}`,
+      partitionKey: { name: 'userId', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'sortKey', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    // Cognito User Pool (L1 construct to ensure AllowAdminCreateUserOnly is false)
+    const cfnUserPool = new cognito.CfnUserPool(this, 'VideoUserPoolCfn', {
+      userPoolName: `video-understanding-users-${this.region}`,
+      adminCreateUserConfig: {
+        allowAdminCreateUserOnly: false,
       },
-    });
-
-    // CloudFront Cache Policy for video streaming
-    const cachePolicy = new cloudfront.CachePolicy(this, 'VideoCachePolicy', {
-      cachePolicyName: `video-cache-policy-${this.region}`,
-      defaultTtl: cdk.Duration.days(1),
-      maxTtl: cdk.Duration.days(365),
-      minTtl: cdk.Duration.seconds(0),
-      enableAcceptEncodingBrotli: false,
-      enableAcceptEncodingGzip: false,
-      headerBehavior: cloudfront.CacheHeaderBehavior.allowList('Range'),
-      cookieBehavior: cloudfront.CacheCookieBehavior.none(),
-      queryStringBehavior: cloudfront.CacheQueryStringBehavior.none(),
-    });
-
-    // CloudFront distribution for video streaming
-    const distribution = new cloudfront.Distribution(this, 'VideoDistribution', {
-      comment: 'Video streaming distribution for video understanding application',
-      defaultBehavior: {
-        origin: origins.S3BucketOrigin.withOriginAccessControl(videoBucket, {
-          originAccessControlId: originAccessControl.attrId,
-        }),
-        cachePolicy: cachePolicy,
-        viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-        allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD_OPTIONS,
-        cachedMethods: cloudfront.CachedMethods.CACHE_GET_HEAD_OPTIONS,
-        compress: true,
-      },
-      httpVersion: cloudfront.HttpVersion.HTTP2,
-      enableIpv6: true,
-      priceClass: cloudfront.PriceClass.PRICE_CLASS_100,
-    });
-
-    // Update bucket policy to allow CloudFront access
-    videoBucket.addToResourcePolicy(new iam.PolicyStatement({
-      actions: ['s3:GetObject'],
-      resources: [videoBucket.arnForObjects('*')],
-      principals: [new iam.ServicePrincipal('cloudfront.amazonaws.com')],
-      conditions: {
-        StringEquals: {
-          'AWS:SourceArn': `arn:${this.partition}:cloudfront::${this.account}:distribution/${distribution.distributionId}`,
+      autoVerifiedAttributes: ['email'],
+      usernameAttributes: ['email'],
+      policies: {
+        passwordPolicy: {
+          minimumLength: 8,
+          requireLowercase: true,
+          requireUppercase: true,
+          requireNumbers: true,
+          requireSymbols: false,
         },
       },
-    }));
+      accountRecoverySetting: {
+        recoveryMechanisms: [{ name: 'verified_email', priority: 1 }],
+      },
+      schema: [{
+        name: 'email',
+        attributeDataType: 'String',
+        required: true,
+        mutable: true,
+      }],
+    });
+    cfnUserPool.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
+
+    const userPool = cognito.UserPool.fromUserPoolId(this, 'VideoUserPool', cfnUserPool.ref);
+
+    const cfnUserPoolClient = new cognito.CfnUserPoolClient(this, 'VideoUserPoolClientCfn', {
+      userPoolId: cfnUserPool.ref,
+      clientName: 'video-understanding-web',
+      explicitAuthFlows: ['ALLOW_USER_SRP_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH'],
+      preventUserExistenceErrors: 'ENABLED',
+    });
+
+    const userPoolClient = cognito.UserPoolClient.fromUserPoolClientId(this, 'VideoUserPoolClient', cfnUserPoolClient.ref);
 
     // OpenSearch Serverless encryption policy
     const encryptionPolicy = new opensearchserverless.CfnSecurityPolicy(this, 'VideoEmbeddingsCollectionEncryptionPolicy', {
@@ -196,28 +192,16 @@ export class InfrastructureStack extends cdk.Stack {
             }),
           ],
         }),
-        S3VectorsAccess: new iam.PolicyDocument({
+        DynamoDBAccess: new iam.PolicyDocument({
           statements: [
             new iam.PolicyStatement({
               actions: [
-                's3vectors:CreateIndex',
-                's3vectors:CreateVectorBucket',
-                's3vectors:DeleteIndex',
-                's3vectors:DeleteVectorBucket',
-                's3vectors:DeleteVectors',
-                's3vectors:GetIndex',
-                's3vectors:GetVectorBucket',
-                's3vectors:GetVectors',
-                's3vectors:ListIndexes',
-                's3vectors:ListVectorBuckets',
-                's3vectors:ListVectors',
-                's3vectors:PutVectors',
-                's3vectors:QueryVectors',
+                'dynamodb:GetItem',
+                'dynamodb:PutItem',
+                'dynamodb:UpdateItem',
+                'dynamodb:Query',
               ],
-              resources: [
-                `arn:aws:s3vectors:${this.region}:${this.account}:*`,
-                `arn:aws:s3vectors:*:${this.account}:*`,
-              ],
+              resources: [metadataTable.tableArn],
             }),
           ],
         }),
@@ -253,6 +237,7 @@ export class InfrastructureStack extends cdk.Stack {
             'aoss:ReadDocument',
             'aoss:WriteDocument',
             'aoss:CreateIndex',
+            'aoss:DeleteIndex',
           ],
           ResourceType: 'index',
         }],
@@ -306,16 +291,20 @@ export class InfrastructureStack extends cdk.Stack {
         OPENSEARCH_ENDPOINT: vectorCollection.attrCollectionEndpoint,
         REGION: this.region,
         AWS_ACCOUNT_ID: this.account,
-        CLOUDFRONT_DOMAIN: distribution.domainName,
+
+        METADATA_TABLE: metadataTable.tableName,
+        CORS_ORIGIN: '*',
+        ADMIN_USER_SUBS: 'f4983d7c-2031-70ec-dfda-38beab6cffc7',
       },
     });
+
 
     // API Gateway
     const api = new apigateway.RestApi(this, 'VideoUnderstandingApi', {
       restApiName: 'Video Understanding API',
       description: 'API for video understanding using Twelve Labs models',
       defaultCorsPreflightOptions: {
-        allowOrigins: ['http://localhost:3000'],
+        allowOrigins: apigateway.Cors.ALL_ORIGINS,
         allowMethods: apigateway.Cors.ALL_METHODS,
         allowHeaders: [
           'Content-Type',
@@ -327,16 +316,58 @@ export class InfrastructureStack extends cdk.Stack {
       },
     });
 
+    const authorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'CognitoAuthorizer', {
+      cognitoUserPools: [userPool],
+    });
+
     const integration = new apigateway.LambdaIntegration(videoProcessingFunction);
 
     // Add API methods
-    api.root.addResource('upload').addMethod('POST', integration);
-    api.root.addResource('analyze').addMethod('POST', integration);
-    api.root.addResource('embed').addMethod('POST', integration);
-    api.root.addResource('search').addMethod('GET', integration);
-    api.root.addResource('status').addMethod('GET', integration);
-    api.root.addResource('video-url').addMethod('GET', integration);
-    api.root.addResource('flush-opensearch').addMethod('POST', integration);
+    api.root.addResource('upload').addMethod('POST', integration, {
+      authorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
+    api.root.addResource('analyze').addMethod('POST', integration, {
+      authorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
+    api.root.addResource('embed').addMethod('POST', integration, {
+      authorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
+    api.root.addResource('search').addMethod('GET', integration, {
+      authorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
+    api.root.addResource('status').addMethod('GET', integration, {
+      authorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
+    api.root.addResource('video-url').addMethod('GET', integration, {
+      authorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
+    api.root.addResource('flush-opensearch').addMethod('POST', integration, {
+      authorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
+    api.root.addResource('videos').addMethod('GET', integration, {
+      authorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
+    api.root.addResource('analyses').addMethod('GET', integration, {
+      authorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
+    api.root.addResource('embeddings').addMethod('GET', integration, {
+      authorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
+    const admin = api.root.addResource('admin');
+    admin.addResource('index-samples').addMethod('POST', integration, {
+      authorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
 
     // Outputs
     new cdk.CfnOutput(this, 'ApiUrl', {
@@ -354,9 +385,41 @@ export class InfrastructureStack extends cdk.Stack {
       value: vectorCollection.attrCollectionEndpoint,
     });
 
-    new cdk.CfnOutput(this, 'CloudFrontDomain', {
-      description: 'CloudFront distribution domain for video streaming',
-      value: distribution.domainName,
+
+    new cdk.CfnOutput(this, 'MetadataTableName', {
+      description: 'DynamoDB metadata table name',
+      value: metadataTable.tableName,
+    });
+
+    // Amplify Hosting
+    const amplifyApp = new amplify.CfnApp(this, 'FrontendApp', {
+      name: `video-understanding-${this.account}-${this.region}`,
+      platform: 'WEB',
+    });
+
+    const mainBranch = new amplify.CfnBranch(this, 'MainBranch', {
+      appId: amplifyApp.attrAppId,
+      branchName: 'main',
+    });
+
+    new cdk.CfnOutput(this, 'UserPoolId', {
+      description: 'Cognito User Pool ID',
+      value: userPool.userPoolId,
+    });
+
+    new cdk.CfnOutput(this, 'UserPoolClientId', {
+      description: 'Cognito User Pool Client ID',
+      value: userPoolClient.userPoolClientId,
+    });
+
+    new cdk.CfnOutput(this, 'AmplifyAppId', {
+      description: 'Amplify App ID',
+      value: amplifyApp.attrAppId,
+    });
+
+    new cdk.CfnOutput(this, 'AmplifyDefaultDomain', {
+      description: 'Amplify Default Domain',
+      value: `https://main.${amplifyApp.attrAppId}.amplifyapp.com`,
     });
   }
 }
