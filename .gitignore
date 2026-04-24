@@ -219,6 +219,20 @@ Pipfile.lock
 
 # Claude/AI assistant files
 .claude/
+CLAUDE.md
+
+# Project-specific build artifacts
+frontend/build/
+frontend/build.zip
+frontend/.env
+frontend/.env.local
+
+# CDK staging
+.cdk.staging/
+
+# IDE: code-server / VS Code remote
+.vscode-server/
+.vscode-remote/
 
 # Terraform files (if any)
 *.tfstate
