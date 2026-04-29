@@ -81,7 +81,7 @@ const VideoPlayer: React.FC<VideoPlayerProps> = ({
     } else {
       console.warn(`⚠️ VideoPlayer: No videoS3Uri provided`);
     }
-  }, [videoS3Uri, onError]);
+  }, [videoS3Uri]);
 
   useEffect(() => {
     // Set the video start time when URL is loaded

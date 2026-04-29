@@ -1,5 +1,11 @@
 /* Only styles still required by custom (non-Cloudscape) components. */
 
+/* Marengo search textarea: ensure visible height and resizable */
+[class*="textarea"] textarea {
+  min-height: 80px !important;
+  resize: vertical !important;
+}
+
 /* VideoPlayer */
 .video-player {
   width: 100%;
@@ -22,7 +28,6 @@
   border-radius: 4px;
 }
 
-.loading-spinner,
 .spinner {
   display: inline-block;
   width: 20px;

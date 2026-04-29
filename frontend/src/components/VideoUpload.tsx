@@ -109,6 +109,13 @@ const VideoUpload: React.FC = () => {
         xhr.send(formData);
       });
 
+      // Confirm upload to promote metadata from pending to active
+      await authFetch(`${API_BASE_URL}/upload-confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key }),
+      });
+
       setSuccess(`"${selectedFile.name}" uploaded successfully.`);
       setFiles([]);
       loadVideos();
@@ -196,6 +203,31 @@ const VideoUpload: React.FC = () => {
             id: 'uploadedAt',
             header: 'Uploaded At',
             cell: (v) => v.uploadedAt || '-',
+          },
+          {
+            id: 'download',
+            header: 'Download',
+            cell: (v) => (
+              <Button
+                iconName="download"
+                variant="inline-link"
+                onClick={async () => {
+                  try {
+                    const res = await authFetch(`${API_BASE_URL}/video-url?videoS3Uri=${encodeURIComponent(v.s3Uri)}`);
+                    if (!res.ok) throw new Error('Failed to get download URL');
+                    const data = await res.json();
+                    const a = document.createElement('a');
+                    a.href = data.presignedUrl;
+                    a.download = v.filename;
+                    a.click();
+                  } catch (e) {
+                    console.error('Download failed:', e);
+                  }
+                }}
+              >
+                Download
+              </Button>
+            ),
           },
         ]}
         empty={

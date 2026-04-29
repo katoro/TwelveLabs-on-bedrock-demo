@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { authFetch } from '../authFetch';
+import VideoPlayer from './VideoPlayer';
 import Alert from '@cloudscape-design/components/alert';
 import Badge from '@cloudscape-design/components/badge';
 import Box from '@cloudscape-design/components/box';
@@ -173,6 +174,16 @@ const PegasusAnalyze: React.FC = () => {
           </SpaceBetween>
 
           {error && <Alert type="error" dismissible onDismiss={() => setError(null)}>{error}</Alert>}
+
+          {selectedVideo && (
+            <FormField label="Video Preview">
+              <VideoPlayer
+                videoS3Uri={selectedVideo.s3Uri}
+                autoPlay={false}
+                onError={(e) => console.error('Video preview error:', e)}
+              />
+            </FormField>
+          )}
         </SpaceBetween>
       </Container>
 

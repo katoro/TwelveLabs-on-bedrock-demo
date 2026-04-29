@@ -10,7 +10,7 @@ import Container from '@cloudscape-design/components/container';
 import ExpandableSection from '@cloudscape-design/components/expandable-section';
 import FormField from '@cloudscape-design/components/form-field';
 import Header from '@cloudscape-design/components/header';
-import Input from '@cloudscape-design/components/input';
+import Textarea from '@cloudscape-design/components/textarea';
 import SpaceBetween from '@cloudscape-design/components/space-between';
 
 interface SearchResult {
@@ -77,18 +77,19 @@ const MarengoSearch: React.FC = () => {
   return (
     <SpaceBetween size="l">
       <Container header={<Header variant="h2" description="자연어로 질의하면 Marengo 3.0이 512차원 벡터로 변환해 OpenSearch에서 유사도 검색을 수행합니다.">Query</Header>}>
-        <SpaceBetween size="s" direction="horizontal">
-          <Box>
-            <FormField>
-              <Input
+        <SpaceBetween size="s">
+          <FormField stretch>
+            <div style={{ minHeight: 80 }}>
+              <Textarea
                 value={query}
                 onChange={({ detail }) => setQuery(detail.value)}
-                onKeyDown={({ detail }) => { if (detail.key === 'Enter') searchVideos(); }}
+                onKeyDown={({ detail }) => { if (detail.key === 'Enter' && !detail.shiftKey) searchVideos(); }}
                 placeholder="예: 사람이 뛰어가는 장면, 격투 장면, 음식 먹는 장면"
                 disabled={loading}
+                rows={4}
               />
-            </FormField>
-          </Box>
+            </div>
+          </FormField>
           <Button variant="primary" onClick={searchVideos} loading={loading} disabled={!query.trim()}>
             Search
           </Button>
