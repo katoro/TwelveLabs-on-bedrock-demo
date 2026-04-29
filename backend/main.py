@@ -448,8 +448,15 @@ def store_embeddings_to_opensearch(bedrock_response, embedding_data_list, origin
     }
 
 def handle_flush_opensearch(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[str, Any]:
-    """Flush/delete all documents from the OpenSearch vector index"""
+    """Flush/delete all documents from the OpenSearch vector index (admin only)"""
     try:
+        if not is_admin(event):
+            return {
+                'statusCode': 403,
+                'headers': cors_headers,
+                'body': json.dumps({'error': 'Admin access required'})
+            }
+
         print("🗑️ Starting OpenSearch index flush...")
         
         opensearch = get_opensearch_client()
@@ -725,6 +732,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if path == '/upload' and method == 'POST':
             print("Routing to handle_upload")
             return handle_upload(event, cors_headers)
+        elif path == '/upload-confirm' and method == 'POST':
+            print("Routing to handle_upload_confirm")
+            return handle_upload_confirm(event, cors_headers)
         elif path == '/analyze' and method == 'POST':
             print("Routing to handle_analyze")
             return handle_analyze(event, cors_headers, context)
@@ -820,7 +830,18 @@ def handle_video_url(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dic
         bucket_name, object_key = parts
         print(f"🪣 Bucket: {bucket_name}")
         print(f"🔑 Object key: {object_key}")
-        
+
+        # Verify ownership: object must belong to caller or shared prefix
+        user_id = get_user_id(event)
+        allowed_prefixes = [f"videos/{user_id}/", f"videos/{SHARED_USER_ID}/"]
+        if not any(object_key.startswith(prefix) for prefix in allowed_prefixes):
+            print(f"❌ Access denied: {object_key} not owned by {user_id}")
+            return {
+                'statusCode': 403,
+                'headers': cors_headers,
+                'body': json.dumps({'error': 'Access denied: you do not own this video'})
+            }
+
         # Check if object exists before generating presigned URL
         try:
             print(f"🔍 Checking if object exists in S3...")
@@ -913,7 +934,7 @@ def handle_upload(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[s
             ExpiresIn=3600
         )
 
-        # Save video metadata to DDB
+        # Save video metadata to DDB as pending (TTL = 24h, promoted on confirm)
         try:
             table = get_metadata_table()
             if table:
@@ -925,8 +946,10 @@ def handle_upload(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[s
                     'bucket': bucket_name,
                     'key': key,
                     'contentType': content_type,
+                    'status': 'pending',
                     'uploadedAt': int(time.time()),
                     'uploadedAtISO': time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
+                    'ttl': int(time.time()) + 86400,
                 })
         except Exception as e:
             print(f"Failed to save video metadata to DDB: {e}")
@@ -948,6 +971,37 @@ def handle_upload(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[s
             'headers': cors_headers,
             'body': json.dumps({'error': str(e)})
         }
+
+def handle_upload_confirm(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[str, Any]:
+    """Confirm upload succeeded — promote metadata from pending to active"""
+    try:
+        body = json.loads(event.get('body', '{}'))
+        key = body.get('key')
+        if not key:
+            return {'statusCode': 400, 'headers': cors_headers, 'body': json.dumps({'error': 'key is required'})}
+
+        user_id = get_user_id(event)
+        bucket_name = os.environ.get('VIDEO_BUCKET')
+
+        # Verify the object actually exists in S3
+        try:
+            s3_client.head_object(Bucket=bucket_name, Key=key)
+        except ClientError:
+            return {'statusCode': 404, 'headers': cors_headers, 'body': json.dumps({'error': 'Upload not found in S3'})}
+
+        # Promote: remove TTL and set status to active
+        table = get_metadata_table()
+        if table:
+            table.update_item(
+                Key={'userId': user_id, 'sortKey': f'VIDEO#{key}'},
+                UpdateExpression='SET #s = :s REMOVE #ttl',
+                ExpressionAttributeNames={'#s': 'status', '#ttl': 'ttl'},
+                ExpressionAttributeValues={':s': 'active'},
+            )
+
+        return {'statusCode': 200, 'headers': cors_headers, 'body': json.dumps({'message': 'Upload confirmed', 'key': key})}
+    except Exception as e:
+        return {'statusCode': 500, 'headers': cors_headers, 'body': json.dumps({'error': str(e)})}
 
 def wait_for_s3_object(s3_uri: str, max_wait_seconds: int = 30) -> bool:
     """Wait for S3 object to be available with exponential backoff"""
@@ -1437,24 +1491,24 @@ def handle_status(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[s
             output_data_config = response.get('outputDataConfig', {})
             s3_output_config = output_data_config.get('s3OutputDataConfig', {})
             output_s3_uri = s3_output_config.get('s3Uri')
-            
+
             if output_s3_uri:
                 # Bedrock creates: s3://bucket/embeddings/{invocationId}
                 # The actual results are in: s3://bucket/embeddings/{invocationId}/output.json
                 uri_parts = output_s3_uri.replace('s3://', '').split('/')
                 bucket = uri_parts[0]
                 key = '/'.join(uri_parts[1:]) + '/output.json'
-                
+
                 try:
                     print(f"Fetching result from S3: {bucket}/{key}")
                     s3_response = s3_client.get_object(Bucket=bucket, Key=key)
                     result_data = json.loads(s3_response['Body'].read())
                     print(f"Retrieved result data structure: {list(result_data.keys())}")
-                    
+
                     # Look up original s3Uri from DDB
                     original_s3_uri = None
+                    embed_user = get_user_id(event)
                     try:
-                        embed_user = get_user_id(event)
                         tbl = get_metadata_table()
                         if tbl:
                             ddb_resp = tbl.query(
@@ -1469,13 +1523,31 @@ def handle_status(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[s
                     except Exception as ddb_e:
                         print(f"Failed to lookup original s3Uri from DDB: {ddb_e}")
 
-                    # Store embeddings to OpenSearch
+                    # Claim completion atomically to prevent duplicate indexing
                     storage_result = None
-                    if 'data' in result_data and result_data['data']:
+                    already_indexed = False
+                    try:
+                        tbl = get_metadata_table()
+                        if tbl:
+                            tbl.update_item(
+                                Key={'userId': embed_user, 'sortKey': f'EMBEDDING#{invocation_arn}'},
+                                UpdateExpression='SET #s = :s',
+                                ConditionExpression='attribute_not_exists(#s) OR #s <> :s',
+                                ExpressionAttributeNames={'#s': 'indexedStatus'},
+                                ExpressionAttributeValues={':s': 'indexed'},
+                            )
+                    except ClientError as ce:
+                        if ce.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                            already_indexed = True
+                            print("Embedding already indexed by another request, skipping")
+                        else:
+                            print(f"Claim check error (will proceed): {ce}")
+
+                    # Store embeddings to OpenSearch only if not already indexed
+                    if not already_indexed and 'data' in result_data and result_data['data']:
                         try:
                             print("Storing embeddings to OpenSearch...")
-                            embed_uid = get_user_id(event)
-                            storage_result = store_embeddings_to_opensearch(response, result_data['data'], original_s3_uri=original_s3_uri, user_id=embed_uid)
+                            storage_result = store_embeddings_to_opensearch(response, result_data['data'], original_s3_uri=original_s3_uri, user_id=embed_user)
                             print(f"OpenSearch storage result: {storage_result}")
                         except Exception as e:
                             print(f"Failed to store embeddings: {e}")
