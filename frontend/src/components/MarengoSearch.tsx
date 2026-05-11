@@ -78,6 +78,11 @@ const MarengoSearch: React.FC = () => {
     <SpaceBetween size="l">
       <Container header={<Header variant="h2" description="자연어로 질의하면 Marengo 3.0이 512차원 벡터로 변환해 OpenSearch에서 유사도 검색을 수행합니다.">Query</Header>}>
         <SpaceBetween size="s">
+          <SpaceBetween direction="horizontal" size="xs">
+            <Button onClick={() => setQuery('당신은 영상 컨텐츠를 제작하는 업무를 맡고 있는 마케팅 담당 부서 직원입니다.\n제공된 영상을 기반으로, 가전제품이 나오는 부분만 이용해서 가전제품 광고 영상을 만들려고 합니다.\n가전제품이 화면에 나오는 장면 필요합니다.')}>가전제품 장면</Button>
+            <Button onClick={() => setQuery('당신은 영상 컨텐츠를 제작하는 업무를 맡고 있는 마케팅 담당 부서 직원입니다.\n제공된 영상을 기반으로, TV가 나오는 부분만 이용해서 TV 광고 영상을 만들려고 합니다.\nTV가 화면에 나오는 장면 필요합니다.')}>TV 장면</Button>
+            <Button onClick={() => setQuery('당신은 영상 컨텐츠를 제작하는 업무를 맡고 있는 마케팅 담당 부서 직원입니다.\n제공된 영상을 기반으로, 주방이 나오는 영상을 이용해서 광고 영상을 만드려고 합니다.\n주방이 나오는 장면이 필요합니다.')}>주방 장면</Button>
+          </SpaceBetween>
           <FormField stretch>
             <div style={{ minHeight: 80 }}>
               <Textarea
