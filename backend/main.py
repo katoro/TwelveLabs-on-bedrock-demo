@@ -79,6 +79,24 @@ def get_user_id(event):
 def is_admin(event):
     return get_user_id(event) in ADMIN_USER_SUBS
 
+def verify_video_s3_uri(s3_uri, user_id, allow_shared=True):
+    """s3Uri가 본인 또는 공유 영상 prefix에 속하는지 검증. 위반 시 (False, reason) 반환."""
+    if not s3_uri or not s3_uri.startswith('s3://'):
+        return False, 'Invalid S3 URI format'
+    parts = s3_uri[5:].split('/', 1)
+    if len(parts) != 2:
+        return False, 'Invalid S3 URI format'
+    bucket, key = parts
+    expected_bucket = os.environ.get('VIDEO_BUCKET')
+    if expected_bucket and bucket != expected_bucket:
+        return False, 'Bucket not allowed'
+    allowed_prefixes = [f"videos/{user_id}/"]
+    if allow_shared:
+        allowed_prefixes.append(f"videos/{SHARED_USER_ID}/")
+    if not any(key.startswith(p) for p in allowed_prefixes):
+        return False, 'Access denied: you do not own this video'
+    return True, None
+
 def get_account_id():
     """Get AWS Account ID dynamically"""
     account_id = os.environ.get('AWS_ACCOUNT_ID')
@@ -554,7 +572,7 @@ def process_analysis_async(event: Dict[str, Any]) -> Dict[str, Any]:
         print(f"Calling Bedrock Pegasus model with request: {json.dumps(request_body, indent=2)}")
         
         response = bedrock_client.invoke_model(
-            modelId='twelvelabs.pegasus-1-2-v1:0',
+            modelId='apac.twelvelabs.pegasus-1-2-v1:0',
             body=json.dumps(request_body),
             contentType='application/json'
         )
@@ -689,8 +707,7 @@ def process_analysis_async(event: Dict[str, Any]) -> Dict[str, Any]:
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Main Lambda handler for video understanding API"""
-    
-    # Check if this is an async processing request (direct Lambda invoke, not API Gateway)
+
     if 'action' in event and event.get('action') == 'process_analysis':
         print("Processing async analysis request")
         return process_analysis_async(event)
@@ -786,15 +803,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 def handle_video_url(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[str, Any]:
     """Generate presigned URL for video playback"""
     try:
-        print(f"🎬 === VIDEO URL REQUEST START ===")
-        print(f"📡 Request event: {json.dumps(event, indent=2)}")
-        print(f"🔒 CORS headers: {cors_headers}")
-        
         query_params = event.get('queryStringParameters', {}) or {}
         video_s3_uri = query_params.get('videoS3Uri')
-        
-        print(f"📹 Video S3 URI requested: {video_s3_uri}")
-        print(f"🔍 All query parameters: {query_params}")
+
+        print(f"📹 Video URL request: {video_s3_uri}")
         
         if not video_s3_uri:
             print("❌ ERROR: videoS3Uri parameter is required but not provided")
@@ -907,7 +919,15 @@ def handle_upload(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[s
                 'headers': cors_headers,
                 'body': json.dumps({'error': 'Filename is required'})
             }
-        
+
+        # filename 경로 순회/서브디렉토리 차단
+        if '/' in filename or '\\' in filename or filename.startswith('.') or '..' in filename:
+            return {
+                'statusCode': 400,
+                'headers': cors_headers,
+                'body': json.dumps({'error': 'Invalid filename'})
+            }
+
         bucket_name = os.environ.get('VIDEO_BUCKET')
         user_id = get_user_id(event)
         key = f"videos/{user_id}/{filename}"
@@ -982,6 +1002,10 @@ def handle_upload_confirm(event: Dict[str, Any], cors_headers: Dict[str, str]) -
 
         user_id = get_user_id(event)
         bucket_name = os.environ.get('VIDEO_BUCKET')
+
+        # key 소유권 검증 — 반드시 본인 prefix에 속해야 함
+        if not key.startswith(f"videos/{user_id}/"):
+            return {'statusCode': 403, 'headers': cors_headers, 'body': json.dumps({'error': 'Access denied'})}
 
         # Verify the object actually exists in S3
         try:
@@ -1166,7 +1190,11 @@ def handle_analyze(event: Dict[str, Any], cors_headers: Dict[str, str], context:
                 'headers': cors_headers,
                 'body': json.dumps({'error': 'S3 URI is required'})
             }
-        
+
+        ok, reason = verify_video_s3_uri(s3_uri, get_user_id(event))
+        if not ok:
+            return {'statusCode': 403, 'headers': cors_headers, 'body': json.dumps({'error': reason})}
+
         # Wait for S3 object to be available
         if not wait_for_s3_object(s3_uri, max_wait_seconds=30):
             return {
@@ -1342,7 +1370,11 @@ def handle_embed(event: Dict[str, Any], cors_headers: Dict[str, str]) -> Dict[st
                 'headers': cors_headers,
                 'body': json.dumps({'error': 'S3 URI and video ID are required'})
             }
-        
+
+        ok, reason = verify_video_s3_uri(s3_uri, get_user_id(event))
+        if not ok:
+            return {'statusCode': 403, 'headers': cors_headers, 'body': json.dumps({'error': reason})}
+
         # Wait for S3 object to be available
         if not wait_for_s3_object(s3_uri, max_wait_seconds=45):
             return {

@@ -221,6 +221,9 @@ Pipfile.lock
 .claude/
 CLAUDE.md
 
+# 부하 테스트 스크립트 — 사번 이메일/공유 비밀번호 등 민감정보 포함되므로 커밋 금지
+load_test_*.py
+
 # Project-specific build artifacts
 frontend/build/
 frontend/build.zip

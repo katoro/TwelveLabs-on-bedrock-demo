@@ -2,6 +2,7 @@ import * as cdk from 'aws-cdk-lib';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
+import * as apigatewayv2 from 'aws-cdk-lib/aws-apigatewayv2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as opensearchserverless from 'aws-cdk-lib/aws-opensearchserverless';
@@ -160,6 +161,7 @@ export class InfrastructureStack extends cdk.Stack {
                 'arn:aws:bedrock:*::foundation-model/twelvelabs.*',
                 `arn:aws:bedrock:*:${this.account}:async-invoke/*`,
                 `arn:aws:bedrock:*:${this.account}:inference-profile/us.twelvelabs.*`,
+                `arn:aws:bedrock:*:${this.account}:inference-profile/apac.twelvelabs.*`,
               ],
             }),
           ],
@@ -421,5 +423,8 @@ export class InfrastructureStack extends cdk.Stack {
       description: 'Amplify Default Domain',
       value: `https://main.${amplifyApp.attrAppId}.amplifyapp.com`,
     });
+
+    // WebSocket 스트리밍 API는 Cognito Authorizer 부착 전까지 비활성화
+    // (익명 접속 시 Bedrock Pegasus 호출/S3 객체 SSRF 위험)
   }
 }
